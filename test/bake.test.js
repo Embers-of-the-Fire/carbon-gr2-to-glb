@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import {
     blendAlbedoWithMaterials,
     buildMetallicRoughnessMap,
-    resampleImage
+    resampleImage,
+    WEBP_ENCODING_POLICY
 } from "../src/bake.js";
 
 function rgba(width, height, colorAt)
@@ -127,4 +128,18 @@ test("metallic-roughness leaves roughness untouched without a mask", () =>
     const roughness = rgba(2, 2, () => [100, 0, 0]);
     const out = buildMetallicRoughnessMap(roughness, null, false, { mask: null, gloss: [0.5, null, 1.0, null] });
     assert.deepEqual(pixel(out, 0, 0), [255, 100, 0, 255]);
+});
+
+test("webp encoding policy covers every emitted texture slot", () =>
+{
+    for (const slot of [ "baseColor", "baseColorDetail", "normal", "metallicRoughness", "emissive", "emissiveHeat" ])
+    {
+        assert.ok(WEBP_ENCODING_POLICY[slot], `missing policy for ${slot}`);
+    }
+    assert.equal(WEBP_ENCODING_POLICY.baseColor.lossless, true);
+    assert.equal(WEBP_ENCODING_POLICY.emissive.lossless, true);
+    assert.equal(WEBP_ENCODING_POLICY.emissiveHeat.lossless, true);
+    assert.equal(WEBP_ENCODING_POLICY.normal.quality, 95);
+    assert.equal(WEBP_ENCODING_POLICY.normal.smartSubsample, true);
+    assert.equal(WEBP_ENCODING_POLICY.metallicRoughness.quality, 95);
 });

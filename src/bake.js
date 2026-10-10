@@ -32,6 +32,21 @@ export function decompressIfGzip(bytes)
     return bytes;
 }
 
+/**
+ * WebP encoding policy per logical texture slot ("balanced" preset):
+ * color maps that must stay crisp go lossless (the faction-blended albedo
+ * compresses well anyway), data maps get high-quality lossy encoding with
+ * full-chroma smart subsampling where it matters (normals).
+ */
+export const WEBP_ENCODING_POLICY = {
+    baseColor: { lossless: true },
+    baseColorDetail: { lossless: true },
+    normal: { quality: 95, smartSubsample: true },
+    metallicRoughness: { quality: 95 },
+    emissive: { lossless: true },
+    emissiveHeat: { lossless: true }
+};
+
 async function decodeDdsRgba(bytes, label)
 {
     const raw = decompressIfGzip(bytes);
@@ -90,13 +105,14 @@ export function makeMappedTextureResolver(files)
     };
 }
 
-async function encodeImage(width, height, data, format)
+async function encodeImage(width, height, data, format, logical)
 {
     if (format?.format === "webp")
     {
+        const policy = WEBP_ENCODING_POLICY[logical] ?? { quality: 90 };
         const webp = await sharp(Buffer.from(data.buffer, data.byteOffset, data.byteLength), {
             raw: { width, height, channels: 4 }
-        }).webp({ quality: format.quality ?? 90 }).toBuffer();
+        }).webp(policy).toBuffer();
         return { data: new Uint8Array(webp), mimeType: "image/webp" };
     }
     const png = await CjsPngFormat.write({ width, height, data });
@@ -315,8 +331,8 @@ function applyDetailMap(image, detail)
  * @param {string} [options.detailMap] `res:/` path of a grayscale detail map
  *   (e.g. SailsDetailMap); when set, an additional `<stem>_basecolor_detail`
  *   image with the detail multiplied in is emitted (slots.baseColorDetail).
- * @param {{format: "png"|"webp", quality?: number}} [options.textureFormat]
- *   Output texture encoding. Default PNG.
+ * @param {{format: "png"|"webp"}} [options.textureFormat]
+ *   Output texture encoding. Default PNG. WebP encodes per WEBP_ENCODING_POLICY.
  * @returns {Promise<{images: Array<{name, data, mimeType}>, slots: {baseColor?, normal?, metallicRoughness?, emissive?, emissiveStrength?}, skipped: string[]}>}
  */
 export async function bakeTextures(stem, options = {})
@@ -352,9 +368,9 @@ export async function bakeTextures(stem, options = {})
     const images = [];
     const slots = {};
 
-    async function addImage(name, rgba)
+    async function addImage(name, rgba, logical)
     {
-        const encoded = await encodeImage(rgba.width, rgba.height, rgba.data, textureFormat);
+        const encoded = await encodeImage(rgba.width, rgba.height, rgba.data, textureFormat, logical);
         images.push({ name, data: encoded.data, mimeType: encoded.mimeType });
         return images.length - 1;
     }
@@ -364,30 +380,30 @@ export async function bakeTextures(stem, options = {})
         const mtl1 = options.diffuse?.[0] ?? tint;
         const mtl3 = options.diffuse?.[2] ?? null;
         const blended = mtl1 ? blendAlbedoWithMaterials(albedo, paintMask, mtl1, mtl3) : albedo;
-        slots.baseColor = await addImage(`${stem}_basecolor`, blended);
+        slots.baseColor = await addImage(`${stem}_basecolor`, blended, "baseColor");
         if (detail)
         {
-            slots.baseColorDetail = await addImage(`${stem}_basecolor_detail`, applyDetailMap(blended, detail));
+            slots.baseColorDetail = await addImage(`${stem}_basecolor_detail`, applyDetailMap(blended, detail), "baseColorDetail");
         }
     }
     else if (paintMask)
     {
         skipped.push(`${names.paintMask ?? stem + "_p3.dds"} (paint mask; no albedo to blend into)`);
     }
-    if (normal) slots.normal = await addImage(`${stem}_normal`, buildNormalMap(normal, flipGreen));
+    if (normal) slots.normal = await addImage(`${stem}_normal`, buildNormalMap(normal, flipGreen), "normal");
     if (roughness || metallic)
     {
-        slots.metallicRoughness = await addImage(`${stem}_mr`, buildMetallicRoughnessMap(roughness, metallic, options.invertRoughness === true, { mask: paintMask, gloss: options.gloss ?? null }));
+        slots.metallicRoughness = await addImage(`${stem}_mr`, buildMetallicRoughnessMap(roughness, metallic, options.invertRoughness === true, { mask: paintMask, gloss: options.gloss ?? null }), "metallicRoughness");
     }
     if (glow)
     {
         const emissive = buildEmissive(glow, options.glowColor ?? null);
-        slots.emissive = await addImage(`${stem}_emissive`, emissive.image);
+        slots.emissive = await addImage(`${stem}_emissive`, emissive.image, "emissive");
         slots.emissiveStrength = emissive.strength;
         if (options.heatGlowColor)
         {
             const heat = buildEmissive(glow, options.heatGlowColor);
-            slots.emissiveHeat = await addImage(`${stem}_heat_emissive`, heat.image);
+            slots.emissiveHeat = await addImage(`${stem}_heat_emissive`, heat.image, "emissiveHeat");
             slots.emissiveHeatStrength = heat.strength;
         }
     }

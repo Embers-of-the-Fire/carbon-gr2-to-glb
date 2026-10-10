@@ -152,8 +152,8 @@ export function buildAreaMaterials(sofShip, slots)
  * @param {{dataBlack: string|Uint8Array, dna: string}} [options.sof] SOF catalog + DNA for real faction data.
  * @param {object} [options.sofShip] Pre-resolved SOF ship (from resolveSofDna);
  *   takes precedence over `sof` so batch runs can share one catalog.
- * @param {{format: "png"|"webp", quality?: number}} [options.textureFormat]
- *   Output texture encoding. Default PNG.
+ * @param {{format: "png"|"webp"}} [options.textureFormat]
+ *   Output texture encoding. Default PNG. WebP encodes per WEBP_ENCODING_POLICY.
  * @param {"meshopt"} [options.geometryCompression] Geometry compression
  *   (EXT_meshopt_compression). Default none.
  * @returns {Promise<{glb: Uint8Array, stats: object}>}

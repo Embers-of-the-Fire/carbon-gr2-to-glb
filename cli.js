@@ -6,7 +6,7 @@
  *   node cli.js <input.gr2> [-o output.glb] [--textures <dir>] [--lod <n>]
  *               [--flip-v] [--no-flip-green] [--no-convert]
  *               [--data-black <path> --dna <h:f:r>]
- *               [--texture-format png|webp] [--texture-quality <n>]
+ *               [--texture-format png|webp]
  *   node cli.js --batch-resolve <manifest.json> [--resolve-out <file>]
  *   node cli.js --batch <manifest.json>
  *
@@ -50,8 +50,9 @@ Options:
                         luminance (for viewers with weak lighting)
   --invert-roughness    Treat the _r map as smoothness (roughness = 1 - value)
   --texture-format <f>  Embedded texture format: png (default) or webp
-                        (EXT_texture_webp; requires WebP-capable loaders)
-  --texture-quality <n> Lossy WebP quality 0..100 (default: 90)
+                        (EXT_texture_webp; requires WebP-capable loaders).
+                        WebP encodes per-slot: lossless color/emissive maps,
+                        q95 (+smart subsample on normals) for data maps.
   --geometry-compression <c>
                         Geometry compression: meshopt (EXT_meshopt_compression;
                         requires a meshopt-capable loader)
@@ -64,7 +65,7 @@ Options:
 
 function parseArgs(argv)
 {
-    const args = { input: null, output: null, textures: null, stem: null, lod: 0, flipV: false, flipGreen: true, convert: true, tint: null, dataBlack: null, dna: null, boost: false, invertRoughness: false, textureFormat: "png", textureQuality: 90, geometryCompression: null, batch: null, batchResolve: null, resolveOut: null };
+    const args = { input: null, output: null, textures: null, stem: null, lod: 0, flipV: false, flipGreen: true, convert: true, tint: null, dataBlack: null, dna: null, boost: false, invertRoughness: false, textureFormat: "png", geometryCompression: null, batch: null, batchResolve: null, resolveOut: null };
     for (let i = 0; i < argv.length; i++)
     {
         const arg = argv[i];
@@ -91,7 +92,6 @@ function parseArgs(argv)
             case "--boost": args.boost = true; break;
             case "--invert-roughness": args.invertRoughness = true; break;
             case "--texture-format": args.textureFormat = argv[++i]; break;
-            case "--texture-quality": args.textureQuality = Number(argv[++i]); break;
             case "--geometry-compression": args.geometryCompression = argv[++i]; break;
             case "--batch": args.batch = argv[++i]; break;
             case "--batch-resolve": args.batchResolve = argv[++i]; break;
@@ -116,7 +116,6 @@ function parseArgs(argv)
     }
     if (!Number.isInteger(args.lod) || args.lod < 0) { console.error("--lod must be a non-negative integer"); process.exit(1); }
     if (![ "png", "webp" ].includes(args.textureFormat)) { console.error("--texture-format must be png or webp"); process.exit(1); }
-    if (!Number.isFinite(args.textureQuality) || args.textureQuality < 0 || args.textureQuality > 100) { console.error("--texture-quality must be in 0..100"); process.exit(1); }
     if (args.geometryCompression !== null && args.geometryCompression !== "meshopt") { console.error("--geometry-compression must be meshopt"); process.exit(1); }
     return args;
 }
@@ -191,7 +190,7 @@ else
         tint: args.tint,
         boost: args.boost,
         invertRoughness: args.invertRoughness,
-        textureFormat: { format: args.textureFormat, quality: args.textureQuality },
+        textureFormat: { format: args.textureFormat },
         geometryCompression: args.geometryCompression ?? undefined,
         sof: args.dataBlack ? { dataBlack: resolve(args.dataBlack), dna: args.dna } : undefined
     });
