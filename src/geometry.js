@@ -39,23 +39,42 @@ export function extractGeometry(shared, options = {})
 
     const positions = new Float32Array(vertex.position);
     const normals = new Float32Array(vertexCount * 3);
+    let tangents = null;
 
     if (vertex.normal?.length)
     {
         normals.set(vertex.normal);
     }
-    else if (vertex.packedTangentLegacy?.length)
+    if (vertex.packedTangentLegacy?.length)
     {
         const packed = vertex.packedTangentLegacy;
+        tangents = new Float32Array(vertexCount * 4);
         for (let i = 0; i < vertexCount; i++)
         {
             const frame = decodeTangentFrame(packed.slice(i * 4, i * 4 + 4));
-            normals[i * 3] = frame.N[0];
-            normals[i * 3 + 1] = frame.N[1];
-            normals[i * 3 + 2] = frame.N[2];
+            if (!vertex.normal?.length)
+            {
+                normals[i * 3] = frame.N[0];
+                normals[i * 3 + 1] = frame.N[1];
+                normals[i * 3 + 2] = frame.N[2];
+            }
+            if (frame.null)
+            {
+                tangents[i * 4] = 1;
+                tangents[i * 4 + 3] = 1;
+                continue;
+            }
+            const cx = frame.N[1] * frame.T[2] - frame.N[2] * frame.T[1];
+            const cy = frame.N[2] * frame.T[0] - frame.N[0] * frame.T[2];
+            const cz = frame.N[0] * frame.T[1] - frame.N[1] * frame.T[0];
+            const handedness = cx * frame.B[0] + cy * frame.B[1] + cz * frame.B[2] >= 0 ? 1 : -1;
+            tangents[i * 4] = frame.T[0];
+            tangents[i * 4 + 1] = frame.T[1];
+            tangents[i * 4 + 2] = frame.T[2];
+            tangents[i * 4 + 3] = handedness;
         }
     }
-    else
+    else if (!vertex.normal?.length)
     {
         throw new Error(`mesh "${mesh.name}" has neither normal nor packedTangentLegacy data`);
     }
@@ -72,6 +91,14 @@ export function extractGeometry(shared, options = {})
     {
         for (let i = 2; i < positions.length; i += 3) positions[i] = -positions[i];
         for (let i = 2; i < normals.length; i += 3) normals[i] = -normals[i];
+        if (tangents)
+        {
+            for (let i = 0; i < tangents.length; i += 4)
+            {
+                tangents[i + 2] = -tangents[i + 2];
+                tangents[i + 3] = -tangents[i + 3];
+            }
+        }
     }
 
     const indexGroups = mesh.indices ?? mesh.lods?.[0]?.indices;
@@ -101,6 +128,7 @@ export function extractGeometry(shared, options = {})
             name: group.name ?? `area_${areaIndex}`,
             positions,
             normals,
+            tangents,
             uvs,
             indices
         };

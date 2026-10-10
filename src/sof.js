@@ -66,13 +66,15 @@ export async function resolveSofDna(sof, dna)
     });
 
     const areas = [];
-    for (const group of [ "opaqueAreas", "transparentAreas", "decalAreas", "distortionAreas", "depthAreas" ])
+    for (const group of [ "opaqueAreas", "transparentAreas", "decalAreas", "additiveAreas", "distortionAreas", "depthAreas" ])
     {
         for (const area of mesh[group] ?? [])
         {
             areas.push({
                 group,
                 name: area.name,
+                index: area.index ?? null,
+                count: area.count ?? null,
                 shader: shaderFamily(area),
                 textures: texturesOf(area),
                 materials: materialsOf(area),

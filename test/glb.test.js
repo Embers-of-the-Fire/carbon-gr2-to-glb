@@ -129,3 +129,56 @@ test("rejects nothing when indices exceed 16 bits via Uint32Array", () =>
     const { json } = parseGlb(glb);
     assert.equal(json.accessors[json.meshes[0].primitives[0].indices].componentType, 5125);
 });
+
+test("writes TANGENT as a VEC4 attribute when provided", () =>
+{
+    const glb = writeGlb({
+        name: "tangent",
+        primitives: [ {
+            name: "area_0",
+            positions: new Float32Array(9),
+            normals: new Float32Array(9),
+            tangents: new Float32Array([ 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1 ]),
+            uvs: new Float32Array(6),
+            indices: new Uint16Array([ 0, 1, 2 ]),
+            material: null
+        } ],
+        materials: [],
+        images: []
+    });
+    const { json } = parseGlb(glb);
+    const prim = json.meshes[0].primitives[0];
+    assert.equal(json.accessors[prim.attributes.TANGENT].type, "VEC4");
+    assert.equal(json.accessors[prim.attributes.TANGENT].count, 3);
+});
+
+test("honors material factor overrides and alphaMode", () =>
+{
+    const glb = writeGlb({
+        name: "glass",
+        primitives: [ {
+            name: "area_0",
+            positions: new Float32Array(9),
+            normals: new Float32Array(9),
+            uvs: new Float32Array(6),
+            indices: new Uint16Array([ 0, 1, 2 ]),
+            material: 0
+        } ],
+        materials: [ {
+            name: "glass",
+            baseColorFactor: [ 1, 1, 1, 0.35 ],
+            metallicFactor: 0,
+            roughnessFactor: 0.05,
+            alphaMode: "BLEND",
+            doubleSided: true
+        } ],
+        images: []
+    });
+    const { json } = parseGlb(glb);
+    const mat = json.materials[0];
+    assert.equal(mat.alphaMode, "BLEND");
+    assert.deepEqual(mat.pbrMetallicRoughness.baseColorFactor, [ 1, 1, 1, 0.35 ]);
+    assert.equal(mat.pbrMetallicRoughness.metallicFactor, 0);
+    assert.equal(mat.pbrMetallicRoughness.roughnessFactor, 0.05);
+    assert.equal(mat.doubleSided, true);
+});

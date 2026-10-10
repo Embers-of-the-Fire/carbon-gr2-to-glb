@@ -185,18 +185,30 @@ export function resampleImage(image, width, height, label)
 }
 
 /** Combine roughness (G) and metallic (B) into one glTF metallicRoughness map. */
-export function buildMetallicRoughnessMap(roughness, metallic, invertRoughness)
+export function buildMetallicRoughnessMap(roughness, metallic, invertRoughness, glossBlend)
 {
     const base = roughness ?? metallic;
     const { width, height } = base;
     if (roughness) roughness = resampleImage(roughness, width, height, "roughness");
     if (metallic) metallic = resampleImage(metallic, width, height, "metallic");
+    let mask = glossBlend?.mask ?? null;
+    if (mask) mask = resampleImage(mask, width, height, "paint mask");
+    const g1 = glossBlend?.gloss?.[0] ?? null;
+    const g3 = glossBlend?.gloss?.[2] ?? g1;
+    const blendGloss = mask && g1 !== null && g3 !== null;
     const out = new Uint8Array(width * height * 4);
     for (let i = 0; i < width * height; i++)
     {
         const r = roughness ? roughness.data[i * 4] : 255;
+        let rough = invertRoughness ? 255 - r : r;
+        if (roughness && blendGloss)
+        {
+            const w = mask.data[i * 4] / 255;
+            const gloss = g1 * (1 - w) + g3 * w;
+            rough = Math.round(255 - (255 - rough) * gloss);
+        }
         out[i * 4] = 255;
-        out[i * 4 + 1] = invertRoughness ? 255 - r : r;
+        out[i * 4 + 1] = rough;
         out[i * 4 + 2] = metallic ? metallic.data[i * 4] : 0;
         out[i * 4 + 3] = 255;
     }
@@ -263,6 +275,21 @@ function buildEmissive(glow, glowColor)
     return { image: applyTint(rgb, normalized), strength };
 }
 
+/** Multiply RGB in place by a grayscale detail map (e.g. sail patterns). */
+function applyDetailMap(image, detail)
+{
+    detail = resampleImage(detail, image.width, image.height, "detail map");
+    const data = new Uint8Array(image.data);
+    for (let i = 0; i < data.length; i += 4)
+    {
+        const d = detail.data[i] / 255;
+        data[i] = Math.round(data[i] * d);
+        data[i + 1] = Math.round(data[i + 1] * d);
+        data[i + 2] = Math.round(data[i + 2] * d);
+    }
+    return { width: image.width, height: image.height, data };
+}
+
 /**
  * Load and bake every texture of one ship set.
  *
@@ -278,8 +305,16 @@ function buildEmissive(glow, glowColor)
  *   logical map: albedo, normal, roughness, metallic, glow, dirt, paintMask.
  * @param {Array<number[]|null>} [options.diffuse] Mtl1..4 diffuse colors; blended
  *   through the paint mask (takes precedence over tint).
+ * @param {Array<number|null>} [options.gloss] Mtl1..4 gloss factors; blended
+ *   through the paint mask onto the roughness channel (roughness' = 1 - (1 - r) * gloss).
  * @param {number[]} [options.glowColor] HDR glow color; tints the emissive map
  *   and sets the emissive strength.
+ * @param {number[]} [options.heatGlowColor] HDR heat glow color; when set, an
+ *   additional `<stem>_heat_emissive` image is emitted for heat-shader areas
+ *   (slots.emissiveHeat / slots.emissiveHeatStrength).
+ * @param {string} [options.detailMap] `res:/` path of a grayscale detail map
+ *   (e.g. SailsDetailMap); when set, an additional `<stem>_basecolor_detail`
+ *   image with the detail multiplied in is emitted (slots.baseColorDetail).
  * @param {{format: "png"|"webp", quality?: number}} [options.textureFormat]
  *   Output texture encoding. Default PNG.
  * @returns {Promise<{images: Array<{name, data, mimeType}>, slots: {baseColor?, normal?, metallicRoughness?, emissive?, emissiveStrength?}, skipped: string[]}>}
@@ -298,14 +333,17 @@ export async function bakeTextures(stem, options = {})
         return tryDecode(bytes, label);
     };
 
-    const [albedo, normal, roughness, metallic, glow, dirt, paintMask] = await Promise.all([
+    const [albedo, normal, roughness, metallic, glow, dirt, paintMask, detail] = await Promise.all([
         load("albedo", "a"),
         load("normal", "n"),
         load("roughness", "r"),
         load("metallic", "m"),
         load("glow", "g"),
         load("dirt", "d"),
-        load("paintMask", "p3")
+        load("paintMask", "p3"),
+        options.detailMap
+            ? (async () => tryDecode(await resolveTexture("detail", options.detailMap, options.detailMap), options.detailMap))()
+            : null
     ]);
 
     const skipped = [];
@@ -327,6 +365,10 @@ export async function bakeTextures(stem, options = {})
         const mtl3 = options.diffuse?.[2] ?? null;
         const blended = mtl1 ? blendAlbedoWithMaterials(albedo, paintMask, mtl1, mtl3) : albedo;
         slots.baseColor = await addImage(`${stem}_basecolor`, blended);
+        if (detail)
+        {
+            slots.baseColorDetail = await addImage(`${stem}_basecolor_detail`, applyDetailMap(blended, detail));
+        }
     }
     else if (paintMask)
     {
@@ -335,13 +377,19 @@ export async function bakeTextures(stem, options = {})
     if (normal) slots.normal = await addImage(`${stem}_normal`, buildNormalMap(normal, flipGreen));
     if (roughness || metallic)
     {
-        slots.metallicRoughness = await addImage(`${stem}_mr`, buildMetallicRoughnessMap(roughness, metallic, options.invertRoughness === true));
+        slots.metallicRoughness = await addImage(`${stem}_mr`, buildMetallicRoughnessMap(roughness, metallic, options.invertRoughness === true, { mask: paintMask, gloss: options.gloss ?? null }));
     }
     if (glow)
     {
         const emissive = buildEmissive(glow, options.glowColor ?? null);
         slots.emissive = await addImage(`${stem}_emissive`, emissive.image);
         slots.emissiveStrength = emissive.strength;
+        if (options.heatGlowColor)
+        {
+            const heat = buildEmissive(glow, options.heatGlowColor);
+            slots.emissiveHeat = await addImage(`${stem}_heat_emissive`, heat.image);
+            slots.emissiveHeatStrength = heat.strength;
+        }
     }
 
     return { images, slots, skipped };

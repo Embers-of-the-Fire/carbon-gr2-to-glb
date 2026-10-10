@@ -17,8 +17,8 @@ function align4(n)
 
 /**
  * @param {object} model
- * @param {Array<{name: string, positions: Float32Array, normals: Float32Array, uvs: Float32Array, indices: Uint16Array|Uint32Array, material: number|null}>} model.primitives
- * @param {Array<{name: string, baseColor?: number, normal?: number, metallicRoughness?: number, emissive?: number, alphaMode?: string, baseColorFactor?: number[], emissiveFactor?: number[]}>} model.materials Texture slots are texture indices.
+ * @param {Array<{name: string, positions: Float32Array, normals: Float32Array, tangents?: Float32Array|null, uvs: Float32Array, indices: Uint16Array|Uint32Array, material: number|null}>} model.primitives
+ * @param {Array<{name: string, baseColor?: number, normal?: number, metallicRoughness?: number, emissive?: number, alphaMode?: string, baseColorFactor?: number[], metallicFactor?: number, roughnessFactor?: number, emissiveFactor?: number[], emissiveStrength?: number, doubleSided?: boolean}>} model.materials Texture slots are texture indices.
  * @param {Array<{name: string, data: Uint8Array, mimeType: string}>} model.images
  * @param {string} [model.name]
  * @returns {Uint8Array} GLB file bytes.
@@ -75,9 +75,9 @@ export function writeGlb(model)
         {
             pbr.metallicRoughnessTexture = { index: mat.metallicRoughness };
         }
-        pbr.metallicFactor = mat.metallicRoughness != null ? 1 : 0;
-        pbr.roughnessFactor = 1;
-        const out = { name: mat.name, pbrMetallicRoughness: pbr, doubleSided: false };
+        pbr.metallicFactor = mat.metallicFactor ?? (mat.metallicRoughness != null ? 1 : 0);
+        pbr.roughnessFactor = mat.roughnessFactor ?? 1;
+        const out = { name: mat.name, pbrMetallicRoughness: pbr, doubleSided: mat.doubleSided === true };
         if (mat.normal !== undefined && mat.normal !== null) out.normalTexture = { index: mat.normal };
         if (mat.emissive !== undefined && mat.emissive !== null)
         {
@@ -100,7 +100,7 @@ export function writeGlb(model)
 
     for (const prim of primitives)
     {
-        const { positions, normals, uvs, indices } = prim;
+        const { positions, normals, tangents, uvs, indices } = prim;
         const vertexCount = positions.length / 3;
         totalVertices += vertexCount;
 
@@ -128,6 +128,14 @@ export function writeGlb(model)
             nrmAccessor = accessors.length - 1;
         }
 
+        let tanAccessor;
+        if (tangents && tangents.length)
+        {
+            const view = pushBuffer(new Uint8Array(tangents.buffer, tangents.byteOffset, tangents.byteLength));
+            accessors.push({ bufferView: view, componentType: COMPONENT_FLOAT, count: vertexCount, type: "VEC4" });
+            tanAccessor = accessors.length - 1;
+        }
+
         let uvAccessor;
         if (uvs && uvs.length)
         {
@@ -147,6 +155,7 @@ export function writeGlb(model)
 
         const attributes = { POSITION: posAccessor };
         if (nrmAccessor !== undefined) attributes.NORMAL = nrmAccessor;
+        if (tanAccessor !== undefined) attributes.TANGENT = tanAccessor;
         if (uvAccessor !== undefined) attributes.TEXCOORD_0 = uvAccessor;
 
         const out = { attributes, indices: indexAccessor, mode: 4 };

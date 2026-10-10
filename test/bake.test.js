@@ -112,3 +112,19 @@ test("metallic-roughness inverts roughness when asked", () =>
     const out = buildMetallicRoughnessMap(roughness, null, true);
     assert.deepEqual(pixel(out, 1, 1), [255, 155, 0, 255]);
 });
+
+test("metallic-roughness applies per-material gloss through the paint mask", () =>
+{
+    const roughness = rgba(2, 2, () => [100, 0, 0]);
+    const mask = rgba(2, 2, (x) => [x === 0 ? 0 : 255, 0, 0]);
+    const out = buildMetallicRoughnessMap(roughness, null, false, { mask, gloss: [0.5, null, 1.0, null] });
+    assert.equal(pixel(out, 0, 0)[1], Math.round(255 - (255 - 100) * 0.5));
+    assert.equal(pixel(out, 1, 0)[1], 100);
+});
+
+test("metallic-roughness leaves roughness untouched without a mask", () =>
+{
+    const roughness = rgba(2, 2, () => [100, 0, 0]);
+    const out = buildMetallicRoughnessMap(roughness, null, false, { mask: null, gloss: [0.5, null, 1.0, null] });
+    assert.deepEqual(pixel(out, 0, 0), [255, 100, 0, 255]);
+});

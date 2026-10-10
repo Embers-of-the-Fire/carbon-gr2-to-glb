@@ -33,7 +33,7 @@
 
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { basename, dirname } from "node:path";
-import { convertShip, pickHullArea } from "./convert.js";
+import { convertShip } from "./convert.js";
 import { createSofContext, resolveSofDna } from "./sof.js";
 import { makeMappedTextureResolver } from "./bake.js";
 
@@ -65,12 +65,19 @@ export async function runBatchResolve(manifest)
         try
         {
             const sofShip = await resolveSofDna(sof, job.dna);
-            const hullArea = pickHullArea(sofShip);
+            const textureResPaths = [];
+            for (const area of sofShip.areas)
+            {
+                for (const path of Object.values(area.textures))
+                {
+                    if (!textureResPaths.includes(path)) textureResPaths.push(path);
+                }
+            }
             jobs.push({
                 id: job.id,
                 dna: job.dna,
                 geometryResPath: sofShip.geometryResPath,
-                textureResPaths: hullArea ? Object.values(hullArea.textures) : []
+                textureResPaths
             });
         }
         catch (error)

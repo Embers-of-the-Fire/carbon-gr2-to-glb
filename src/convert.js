@@ -15,6 +15,16 @@ function isHeatShader(shader)
     return /heat|glowcylindric/i.test(shader ?? "");
 }
 
+function isGlassShader(shader)
+{
+    return /glass/i.test(shader ?? "");
+}
+
+function isSailsShader(shader)
+{
+    return /sails/i.test(shader ?? "");
+}
+
 function luminance(rgb)
 {
     return 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
@@ -44,6 +54,84 @@ function normalizeMaterialBrightness(diffuse)
 export function pickHullArea(sofShip)
 {
     return sofShip?.areas.find((area) => area.group === "opaqueAreas" && !isHeatShader(area.shader)) ?? null;
+}
+
+/** Glass canopy look: translucent dark blend, glossy under environment lighting. */
+const GLASS_BASE_COLOR_FACTOR = [ 1, 1, 1, 0.35 ];
+const GLASS_ROUGHNESS_FACTOR = 0.05;
+const GLASS_METALLIC_FACTOR = 0;
+
+/**
+ * Build the glTF material list for a ship: one material per SOF area class
+ * (hull, heat, glass, sails, transparent/decal), sharing one baked texture set.
+ *
+ * @param {object|null} sofShip Resolved SOF ship (null in stem-fallback mode).
+ * @param {object} slots Baked texture slots from bakeTextures.
+ * @returns {{materials: Array<object>, materialByGroupIndex: Map<number, number>, defaultMaterial: number|null}}
+ */
+export function buildAreaMaterials(sofShip, slots)
+{
+    const has = Object.keys(slots).length > 0;
+    const materials = [];
+    const push = (mat) =>
+    {
+        materials.push(mat);
+        return materials.length - 1;
+    };
+
+    const hullMat = has ? push({
+        name: "hull",
+        baseColor: slots.baseColor,
+        normal: slots.normal,
+        metallicRoughness: slots.metallicRoughness,
+        emissive: slots.emissive,
+        emissiveStrength: slots.emissiveStrength
+    }) : null;
+
+    if (!sofShip) return { materials, materialByGroupIndex: new Map(), defaultMaterial: hullMat };
+
+    const heatMat = slots.emissiveHeat !== undefined ? push({
+        name: "heat",
+        baseColor: slots.baseColor,
+        normal: slots.normal,
+        metallicRoughness: slots.metallicRoughness,
+        emissive: slots.emissiveHeat,
+        emissiveStrength: slots.emissiveHeatStrength
+    }) : hullMat;
+
+    const glassMat = has ? push({
+        name: "glass",
+        baseColor: slots.baseColor,
+        normal: slots.normal,
+        metallicRoughness: slots.metallicRoughness,
+        baseColorFactor: GLASS_BASE_COLOR_FACTOR,
+        metallicFactor: GLASS_METALLIC_FACTOR,
+        roughnessFactor: GLASS_ROUGHNESS_FACTOR,
+        alphaMode: "BLEND"
+    }) : hullMat;
+
+    const sailsMat = slots.baseColorDetail !== undefined ? push({
+        name: "sails",
+        baseColor: slots.baseColorDetail,
+        normal: slots.normal,
+        metallicRoughness: slots.metallicRoughness,
+        emissive: slots.emissive,
+        emissiveStrength: slots.emissiveStrength
+    }) : hullMat;
+
+    const materialByGroupIndex = new Map();
+    for (const area of sofShip.areas)
+    {
+        if (area.index === null || area.index === undefined) continue;
+        if (materialByGroupIndex.has(area.index)) continue;
+        if (isHeatShader(area.shader)) materialByGroupIndex.set(area.index, heatMat);
+        else if (isGlassShader(area.shader)) materialByGroupIndex.set(area.index, glassMat);
+        else if (isSailsShader(area.shader)) materialByGroupIndex.set(area.index, sailsMat);
+        else if (area.group === "transparentAreas") materialByGroupIndex.set(area.index, glassMat);
+        else materialByGroupIndex.set(area.index, hullMat);
+    }
+
+    return { materials, materialByGroupIndex, defaultMaterial: hullMat };
 }
 
 /**
@@ -92,6 +180,8 @@ export async function convertShip(gr2Bytes, options)
     }
 
     const hullArea = pickHullArea(sofShip);
+    const heatArea = sofShip?.areas.find((area) => isHeatShader(area.shader)) ?? null;
+    const sailsArea = sofShip?.areas.find((area) => isSailsShader(area.shader)) ?? null;
 
     const { images, slots, skipped } = await bakeTextures(options.stem, {
         textureDir: options.textureDir,
@@ -111,17 +201,18 @@ export async function convertShip(gr2Bytes, options)
         diffuse: hullArea?.materials.diffuse
             ? (options.boost === true ? normalizeMaterialBrightness(hullArea.materials.diffuse) : hullArea.materials.diffuse)
             : null,
+        gloss: hullArea?.materials.gloss ?? null,
         glowColor: hullArea?.glowColor ?? null,
+        heatGlowColor: heatArea?.heatGlowColor ?? heatArea?.glowColor ?? null,
+        detailMap: sailsArea?.textures.SailsDetailMap ?? null,
         invertRoughness: options.invertRoughness
     });
 
-    const materials = [];
-    const hullMaterialIndex = materials.length;
-    materials.push({ name: hullArea?.name ?? options.stem, ...slots });
+    const { materials, materialByGroupIndex, defaultMaterial } = buildAreaMaterials(sofShip, slots);
 
-    primitives.forEach((prim) =>
+    primitives.forEach((prim, groupIndex) =>
     {
-        prim.material = Object.keys(slots).length ? hullMaterialIndex : null;
+        prim.material = materialByGroupIndex.get(groupIndex) ?? defaultMaterial;
     });
 
     let glb = writeGlb({ name, primitives, materials, images });
