@@ -1,8 +1,9 @@
 /**
  * Minimal glTF 2.0 binary (GLB) writer.
  *
- * Takes ready-made geometry and PNG-encoded images, assembles the JSON chunk
- * and a single BIN chunk, and returns the .glb bytes.
+ * Takes ready-made geometry and encoded images, assembles the JSON chunk
+ * and a single BIN chunk, and returns the .glb bytes. WebP images are wired
+ * through EXT_texture_webp (marked as required, with no lossless fallback).
  */
 
 const COMPONENT_FLOAT = 5126;
@@ -17,8 +18,8 @@ function align4(n)
 /**
  * @param {object} model
  * @param {Array<{name: string, positions: Float32Array, normals: Float32Array, uvs: Float32Array, indices: Uint16Array|Uint32Array, material: number|null}>} model.primitives
- * @param {Array<{name: string, baseColor?: number, normal?: number, metallicRoughness?: number, emissive?: number, alphaMode?: string, baseColorFactor?: number[], emissiveFactor?: number[]}>} model.materials Texture slots are image indices.
- * @param {Array<{name: string, png: Uint8Array}>} model.images
+ * @param {Array<{name: string, baseColor?: number, normal?: number, metallicRoughness?: number, emissive?: number, alphaMode?: string, baseColorFactor?: number[], emissiveFactor?: number[]}>} model.materials Texture slots are texture indices.
+ * @param {Array<{name: string, data: Uint8Array, mimeType: string}>} model.images
  * @param {string} [model.name]
  * @returns {Uint8Array} GLB file bytes.
  */
@@ -44,13 +45,22 @@ export function writeGlb(model)
 
     for (const image of images)
     {
-        const view = pushBuffer(image.png);
-        gltfImages.push({ name: image.name, mimeType: "image/png", bufferView: view });
+        const view = pushBuffer(image.data);
+        gltfImages.push({ name: image.name, mimeType: image.mimeType, bufferView: view });
     }
 
+    let usesWebp = false;
     for (let i = 0; i < images.length; i++)
     {
-        textures.push({ name: images[i].name, sampler: 0, source: i });
+        if (images[i].mimeType === "image/webp")
+        {
+            usesWebp = true;
+            textures.push({ name: images[i].name, sampler: 0, extensions: { EXT_texture_webp: { source: i } } });
+        }
+        else
+        {
+            textures.push({ name: images[i].name, sampler: 0, source: i });
+        }
     }
 
     const gltfMaterials = materials.map((mat) =>
@@ -159,9 +169,16 @@ export function writeGlb(model)
         buffers: [ { byteLength: binLength } ]
     };
 
+    const extensionsUsed = [];
     if (gltfMaterials.some((mat) => mat.extensions?.KHR_materials_emissive_strength))
     {
-        gltf.extensionsUsed = [ "KHR_materials_emissive_strength" ];
+        extensionsUsed.push("KHR_materials_emissive_strength");
+    }
+    if (usesWebp) extensionsUsed.push("EXT_texture_webp");
+    if (extensionsUsed.length)
+    {
+        gltf.extensionsUsed = extensionsUsed;
+        if (usesWebp) gltf.extensionsRequired = [ "EXT_texture_webp" ];
     }
 
     const jsonBytes = new TextEncoder().encode(JSON.stringify(gltf));

@@ -55,10 +55,10 @@ test("embeds images and references them from material slots", () =>
         } ],
         materials: [ { name: "tex", baseColor: 0, normal: 1, metallicRoughness: 2, emissive: 3 } ],
         images: [
-            { name: "a", png },
-            { name: "b", png },
-            { name: "c", png },
-            { name: "d", png }
+            { name: "a", data: png, mimeType: "image/png" },
+            { name: "b", data: png, mimeType: "image/png" },
+            { name: "c", data: png, mimeType: "image/png" },
+            { name: "d", data: png, mimeType: "image/png" }
         ]
     });
 
@@ -75,6 +75,40 @@ test("embeds images and references them from material slots", () =>
         assert.equal(image.mimeType, "image/png");
         assert.equal(typeof image.bufferView, "number");
     }
+    for (const texture of json.textures)
+    {
+        assert.equal(typeof texture.source, "number");
+        assert.equal(texture.extensions, undefined);
+    }
+});
+
+test("wires webp images through EXT_texture_webp and marks it required", () =>
+{
+    const png = new Uint8Array([ 0x89, 0x50, 0x4e, 0x47 ]);
+    const webp = new Uint8Array([ 0x52, 0x49, 0x46, 0x46 ]);
+    const glb = writeGlb({
+        name: "webp",
+        primitives: [ {
+            name: "area_0",
+            positions: new Float32Array(9),
+            normals: new Float32Array(9),
+            uvs: new Float32Array(6),
+            indices: new Uint16Array([ 0, 1, 2 ]),
+            material: 0
+        } ],
+        materials: [ { name: "tex", baseColor: 0, normal: 1 } ],
+        images: [
+            { name: "a", data: webp, mimeType: "image/webp" },
+            { name: "b", data: png, mimeType: "image/png" }
+        ]
+    });
+
+    const { json } = parseGlb(glb);
+    assert.deepEqual(json.extensionsRequired, [ "EXT_texture_webp" ]);
+    assert.ok(json.extensionsUsed.includes("EXT_texture_webp"));
+    assert.equal(json.textures[0].source, undefined);
+    assert.deepEqual(json.textures[0].extensions, { EXT_texture_webp: { source: 0 } });
+    assert.equal(json.textures[1].source, 1);
 });
 
 test("rejects nothing when indices exceed 16 bits via Uint32Array", () =>

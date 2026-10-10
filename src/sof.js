@@ -2,6 +2,10 @@
  * SOF integration: pull real faction material colors, glow colors, shader
  * identity and authoritative texture paths for one ship DNA from the client's
  * SOF catalog (data.black).
+ *
+ * `createSofContext` loads the catalog once; `resolveSofDna` resolves any
+ * number of DNA strings against it. Texture values are full `res:/...` paths
+ * so callers can resolve them against a resource index or cache.
  */
 
 import { readFile } from "node:fs/promises";
@@ -22,14 +26,25 @@ function shaderFamily(area)
 }
 
 /**
- * @param {string} dataBlackPath Path to the client's data.black (gzip or raw).
+ * @param {string|Uint8Array} dataBlack Path to the client's data.black
+ *   (gzip or raw), or the catalog bytes directly.
+ * @returns {Promise<object>} EveSOF instance bound to the catalog.
+ */
+export async function createSofContext(dataBlack)
+{
+    const bytes = typeof dataBlack === "string"
+        ? decompressIfGzip(new Uint8Array(await readFile(dataBlack)))
+        : decompressIfGzip(dataBlack);
+    return EveSOF.Create({ black: bytes });
+}
+
+/**
+ * @param {object} sof EveSOF instance from createSofContext.
  * @param {string} dna SOF DNA, e.g. "af1_t1:amarrbase:amarr".
  * @returns {Promise<{dna: string, geometryResPath: string|null, areas: Array<object>}>}
  */
-export async function loadSofShip(dataBlackPath, dna)
+export async function resolveSofDna(sof, dna)
 {
-    const bytes = decompressIfGzip(new Uint8Array(await readFile(dataBlackPath)));
-    const sof = await EveSOF.Create({ black: bytes });
     const values = await sof.BuildValuesFromDNA(dna);
 
     const mesh = values.mesh;
@@ -40,7 +55,7 @@ export async function loadSofShip(dataBlackPath, dna)
         const out = {};
         for (const res of area.effect?.resources ?? [])
         {
-            if (res.resourcePath) out[res.name] = basename(res.resourcePath);
+            if (res.resourcePath) out[res.name] = res.resourcePath;
         }
         return out;
     };
@@ -72,4 +87,15 @@ export async function loadSofShip(dataBlackPath, dna)
         geometryResPath: mesh.geometryResPath ?? null,
         areas
     };
+}
+
+/**
+ * Backward-compatible one-shot helper: load the catalog and resolve one DNA.
+ *
+ * @param {string|Uint8Array} dataBlackPath Path to data.black (gzip or raw), or its bytes.
+ * @param {string} dna SOF DNA, e.g. "af1_t1:amarrbase:amarr".
+ */
+export async function loadSofShip(dataBlackPath, dna)
+{
+    return resolveSofDna(await createSofContext(dataBlackPath), dna);
 }

@@ -53,6 +53,9 @@ node cli.js /path/to/af1_t1.gr2 \
 | `--flip-v` | Flip UV V coordinates |
 | `--no-flip-green` | Keep DirectX normal-map green channel |
 | `--no-convert` | Skip left-handed → right-handed coordinate conversion |
+| `--texture-format png\|webp` | Embedded texture format (default: `png`; `webp` uses `EXT_texture_webp`) |
+| `--texture-quality <n>` | Lossy WebP quality 0..100 (default: 90) |
+| `--geometry-compression meshopt` | Geometry compression via `EXT_meshopt_compression` |
 
 ### Input files
 
@@ -73,6 +76,45 @@ All inputs may be gzip-wrapped (as found in the client's resource cache); they a
 ### DNA strings
 
 The DNA identifies a ship variant: `hull:faction:race`. For t1 ships the hull name is the model file stem, e.g. `af1_t1:amarrbase:amarr`, `rifter:minmatar:minmatar`. The catalog can be enumerated through the runtime's `EveSOF` API for other hulls/factions.
+
+### Batch mode
+
+For converting many ships against one catalog, batch mode loads `data.black`
+once and never touches the network — the caller resolves and stages all asset
+bytes:
+
+```sh
+# Phase 1: resolve every job's DNA to authoritative res:/ asset paths
+node cli.js --batch-resolve manifest.json --resolve-out resolved.json
+
+# (caller stages the reported files locally, then fills in gr2/textures/out)
+
+# Phase 2: convert everything offline
+node cli.js --batch manifest.json
+```
+
+Manifest schema (see `src/batch.js`):
+
+```jsonc
+{
+  "dataBlack": "/path/to/data.black",
+  "texture": { "format": "webp", "quality": 90 },  // optional default
+  "geometry": "meshopt",                           // optional default
+  "jobs": [
+    {
+      "id": "587",                                 // opaque caller key
+      "dna": "mf4_t1:minmatarbase:minmatar",
+      // convert phase only:
+      "gr2": "/staged/mf4_t1.gr2",
+      "textures": { "res:/dx9/...": "/staged/file.dds" },
+      "out": "/out/587.glb"
+    }
+  ]
+}
+```
+
+Resolved jobs report full `res:/...` paths, so assets can be staged from a
+client cache or a resource index (`resfileindex.txt`) lookup.
 
 ## What the converter does
 
@@ -97,12 +139,15 @@ pnpm test   # node --test
 Layout:
 
 ```
-cli.js          command-line entry
+cli.js          command-line entry (single-file + batch modes)
+index.js        programmatic entry (barrel)
 src/convert.js  orchestration (GR2 + textures + SOF -> GLB)
 src/geometry.js shared-mesh -> per-primitive buffers (normals, UVs, LH->RH)
-src/bake.js     DDS decode + per-texel PBR baking + PNG encode
-src/glb.js      minimal glTF 2.0 binary writer
+src/bake.js     DDS decode + per-texel PBR baking + PNG/WebP encode
+src/glb.js      minimal glTF 2.0 binary writer (EXT_texture_webp aware)
+src/compress.js optional EXT_meshopt_compression post-pass (gltf-transform)
 src/sof.js      data.black catalog queries (colors, glow, texture paths)
+src/batch.js    two-phase batch driver (resolve / convert)
 ```
 
 ## License

@@ -1,5 +1,5 @@
 /**
- * High-level conversion: EVE ship (.gr2 + sibling .dds textures) to .glb.
+ * High-level conversion: EVE ship (.gr2 + DDS textures) to .glb.
  */
 
 import { CjsGr2Format } from "@carbonenginejs/runtime/resource/formats/gr2";
@@ -8,6 +8,7 @@ import { extractGeometry } from "./geometry.js";
 import { bakeTextures, decompressIfGzip } from "./bake.js";
 import { loadSofShip } from "./sof.js";
 import { writeGlb } from "./glb.js";
+import { compressGlbGeometry } from "./compress.js";
 
 function isHeatShader(shader)
 {
@@ -34,18 +35,39 @@ function normalizeMaterialBrightness(diffuse)
 }
 
 /**
+ * Pick the primary opaque hull area (the one carrying the ship's albedo set)
+ * from a resolved SOF ship.
+ *
+ * @param {object|null} sofShip Resolved SOF ship from resolveSofDna/loadSofShip.
+ * @returns {object|null}
+ */
+export function pickHullArea(sofShip)
+{
+    return sofShip?.areas.find((area) => area.group === "opaqueAreas" && !isHeatShader(area.shader)) ?? null;
+}
+
+/**
  * @param {Uint8Array} gr2Bytes GR2 file bytes (gzip-wrapped or raw).
  * @param {object} options
- * @param {string} options.textureDir Directory holding the DDS set.
  * @param {string} options.stem Texture stem, e.g. "af1_t1".
+ * @param {string} [options.textureDir] Directory holding the DDS set (default
+ *   filesystem resolver; ignored when `resolveTexture` is given).
+ * @param {(logical: string, resPath: string|null, fallbackName: string) => Promise<Uint8Array|null>} [options.resolveTexture]
+ *   Texture byte source overriding `textureDir`.
  * @param {number} [options.lod] LOD mesh index. Default 0 (full detail).
  * @param {boolean} [options.convertCoordinates] Default true.
  * @param {boolean} [options.flipV] Default false.
  * @param {boolean} [options.flipGreen] Default true.
  * @param {number[]} [options.tint] RGB albedo multiplier (ignored when SOF provides colors).
  * @param {boolean} [options.boost] Normalize faction-color brightness to the raw
- *   albedo luminance. Default true; pass false for data-faithful darkening.
- * @param {{dataBlack: string, dna: string}} [options.sof] SOF catalog + DNA for real faction data.
+ *   albedo luminance. Default false (data-faithful darkening).
+ * @param {{dataBlack: string|Uint8Array, dna: string}} [options.sof] SOF catalog + DNA for real faction data.
+ * @param {object} [options.sofShip] Pre-resolved SOF ship (from resolveSofDna);
+ *   takes precedence over `sof` so batch runs can share one catalog.
+ * @param {{format: "png"|"webp", quality?: number}} [options.textureFormat]
+ *   Output texture encoding. Default PNG.
+ * @param {"meshopt"} [options.geometryCompression] Geometry compression
+ *   (EXT_meshopt_compression). Default none.
  * @returns {Promise<{glb: Uint8Array, stats: object}>}
  */
 export async function convertShip(gr2Bytes, options)
@@ -59,21 +81,24 @@ export async function convertShip(gr2Bytes, options)
         flipV: options.flipV
     });
 
-    let sofShip = null;
-    if (options.sof)
+    let sofShip = options.sofShip ?? null;
+    if (!sofShip && options.sof)
     {
         sofShip = await loadSofShip(options.sof.dataBlack, options.sof.dna);
-        if (sofShip.geometryResPath && !sofShip.geometryResPath.toLowerCase().endsWith(`${options.stem.toLowerCase()}.gr2`))
-        {
-            console.warn(`warning: DNA resolves to ${sofShip.geometryResPath}, but input stem is "${options.stem}"`);
-        }
+    }
+    if (sofShip?.geometryResPath && !sofShip.geometryResPath.toLowerCase().endsWith(`${options.stem.toLowerCase()}.gr2`))
+    {
+        console.warn(`warning: DNA resolves to ${sofShip.geometryResPath}, but input stem is "${options.stem}"`);
     }
 
-    const hullArea = sofShip?.areas.find((area) => area.group === "opaqueAreas" && !isHeatShader(area.shader)) ?? null;
+    const hullArea = pickHullArea(sofShip);
 
-    const { images, slots, skipped } = await bakeTextures(options.textureDir, options.stem, {
+    const { images, slots, skipped } = await bakeTextures(options.stem, {
+        textureDir: options.textureDir,
+        resolveTexture: options.resolveTexture,
         flipGreen: options.flipGreen,
         tint: options.tint,
+        textureFormat: options.textureFormat,
         textureNames: hullArea ? {
             albedo: hullArea.textures.AlbedoMap,
             normal: hullArea.textures.NormalMap,
@@ -99,7 +124,11 @@ export async function convertShip(gr2Bytes, options)
         prim.material = Object.keys(slots).length ? hullMaterialIndex : null;
     });
 
-    const glb = writeGlb({ name, primitives, materials, images });
+    let glb = writeGlb({ name, primitives, materials, images });
+    if (options.geometryCompression === "meshopt")
+    {
+        glb = await compressGlbGeometry(glb);
+    }
 
     return {
         glb,
@@ -114,7 +143,11 @@ export async function convertShip(gr2Bytes, options)
             vertices: primitives.length ? primitives[0].positions.length / 3 : 0,
             images: images.map((image) => image.name),
             materials: materials.map((mat) => mat.name),
-            skippedTextures: skipped
+            skippedTextures: skipped,
+            compression: {
+                textures: options.textureFormat?.format ?? "png",
+                geometry: options.geometryCompression ?? "none"
+            }
         }
     };
 }

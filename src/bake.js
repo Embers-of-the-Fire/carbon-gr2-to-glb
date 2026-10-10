@@ -1,5 +1,5 @@
 /**
- * Texture baking: EVE DDS maps to glTF PBR PNGs.
+ * Texture baking: EVE DDS maps to glTF PBR textures.
  *
  * Suffix conventions observed on ship texture sets (all maps share one UV space):
  *   _a  BC7 RGBA  albedo (base color)
@@ -9,13 +9,19 @@
  *   _g  BC4 R     glow (emissive)
  *   _d  BC4 R     dirt  (unused: needs the shader's blend math)
  *   _p3 BC4 R     paint mask (unused without SOF material colors)
+ *
+ * Texture bytes are obtained through a resolver callback
+ * `(logical, resPath, fallbackName) => bytes | null`, so callers can serve
+ * files from a local directory, a staged cache, or any other source. Output
+ * encoding is configurable: PNG (lossless) or WebP (EXT_texture_webp).
  */
 
 import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { gunzipSync } from "node:zlib";
 import { CjsDdsFormat } from "@carbonenginejs/runtime/resource/formats/dds";
 import { CjsPngFormat } from "@carbonenginejs/runtime/resource/formats/png";
+import sharp from "sharp";
 
 export function decompressIfGzip(bytes)
 {
@@ -26,34 +32,75 @@ export function decompressIfGzip(bytes)
     return bytes;
 }
 
-async function readDdsRgba(path)
+async function decodeDdsRgba(bytes, label)
 {
-    const bytes = decompressIfGzip(new Uint8Array(await readFile(path)));
-    const image = await CjsDdsFormat.read(bytes, { emit: "rgba" });
+    const raw = decompressIfGzip(bytes);
+    const image = await CjsDdsFormat.read(raw, { emit: "rgba" });
     if (!image?.data?.length || !image.width || !image.height)
     {
-        throw new Error(`${path}: DDS decode produced no pixels`);
+        throw new Error(`${label}: DDS decode produced no pixels`);
     }
     return { width: image.width, height: image.height, data: image.data };
 }
 
-async function tryRead(path)
+async function tryDecode(bytes, label)
 {
-    try
-    {
-        return await readDdsRgba(path);
-    }
-    catch (error)
-    {
-        if (error.code === "ENOENT") return null;
-        throw error;
-    }
+    if (!bytes) return null;
+    return decodeDdsRgba(bytes, label);
 }
 
-async function encodePng(width, height, data)
+/**
+ * Filesystem-backed texture resolver: serves `<dir>/<basename(resPath)>` or,
+ * when no SOF path is known, `<dir>/<fallbackName>`.
+ *
+ * @param {string} dir Directory containing the DDS files.
+ * @returns {(logical: string, resPath: string|null, fallbackName: string) => Promise<Uint8Array|null>}
+ */
+export function makeFileTextureResolver(dir)
 {
+    return async (logical, resPath, fallbackName) =>
+    {
+        const file = join(dir, resPath ? basename(resPath) : fallbackName);
+        try
+        {
+            return new Uint8Array(await readFile(file));
+        }
+        catch (error)
+        {
+            if (error.code === "ENOENT") return null;
+            throw error;
+        }
+    };
+}
+
+/**
+ * Directory-map texture resolver: serves bytes from an explicit
+ * `res:/... -> local path` map (e.g. a staged download cache).
+ *
+ * @param {Record<string, string>} files Map of full resource path to local file.
+ * @returns {(logical: string, resPath: string|null, fallbackName: string) => Promise<Uint8Array|null>}
+ */
+export function makeMappedTextureResolver(files)
+{
+    return async (logical, resPath) =>
+    {
+        const local = resPath ? files[resPath] : null;
+        if (!local) return null;
+        return new Uint8Array(await readFile(local));
+    };
+}
+
+async function encodeImage(width, height, data, format)
+{
+    if (format?.format === "webp")
+    {
+        const webp = await sharp(Buffer.from(data.buffer, data.byteOffset, data.byteLength), {
+            raw: { width, height, channels: 4 }
+        }).webp({ quality: format.quality ?? 90 }).toBuffer();
+        return { data: new Uint8Array(webp), mimeType: "image/webp" };
+    }
     const png = await CjsPngFormat.write({ width, height, data });
-    return png instanceof Uint8Array ? png : new Uint8Array(png);
+    return { data: png instanceof Uint8Array ? png : new Uint8Array(png), mimeType: "image/png" };
 }
 
 /** Rebuild a glTF-convention RGB normal map from a BC5 (RG) DDS. */
@@ -75,16 +122,75 @@ function buildNormalMap(image, flipGreen)
     return { width, height, data: out };
 }
 
-/** Combine roughness (G) and metallic (B) into one glTF metallicRoughness map. */
-function buildMetallicRoughnessMap(roughness, metallic, invertRoughness)
+/**
+ * Bilinear resample of an RGBA map to a target size.
+ *
+ * EVE texture sets all share one UV space, so a map may ship at a lower
+ * resolution than the rest (paint masks are commonly half the albedo size);
+ * resampling keeps every map texel-aligned instead of failing the conversion.
+ * Returns the input object untouched when the size already matches.
+ *
+ * @param {{width: number, height: number, data: Uint8Array}} image
+ * @param {number} width Target width.
+ * @param {number} height Target height.
+ * @param {string} [label] Map name used in the resample warning.
+ * @returns {{width: number, height: number, data: Uint8Array}}
+ */
+export function resampleImage(image, width, height, label)
 {
-    const source = roughness ?? metallic;
-    const { width, height } = source;
-    const other = roughness ?? metallic;
-    if (other && (other.width !== width || other.height !== height))
+    if (image.width === width && image.height === height) return image;
+    console.warn(
+        `resampled ${label ?? "map"} ${image.width}x${image.height} -> ${width}x${height}`
+    );
+    const srcWidth = image.width;
+    const srcHeight = image.height;
+    const src = image.data;
+    const out = new Uint8Array(width * height * 4);
+    const cols = new Int32Array(width);
+    const colFrac = new Float32Array(width);
+    for (let x = 0; x < width; x++)
     {
-        throw new Error(`roughness (${roughness?.width ?? "-"}x${roughness?.height ?? "-"}) and metallic (${metallic?.width ?? "-"}x${metallic?.height ?? "-"}) sizes differ`);
+        const fx = Math.min(Math.max((x + 0.5) * srcWidth / width - 0.5, 0), srcWidth - 1);
+        cols[x] = Math.floor(fx);
+        colFrac[x] = fx - cols[x];
     }
+    const rows = new Int32Array(height);
+    const rowFrac = new Float32Array(height);
+    for (let y = 0; y < height; y++)
+    {
+        const fy = Math.min(Math.max((y + 0.5) * srcHeight / height - 0.5, 0), srcHeight - 1);
+        rows[y] = Math.floor(fy);
+        rowFrac[y] = fy - rows[y];
+    }
+    for (let y = 0; y < height; y++)
+    {
+        const row0 = rows[y] * srcWidth * 4;
+        const row1 = Math.min(rows[y] + 1, srcHeight - 1) * srcWidth * 4;
+        const ty = rowFrac[y];
+        for (let x = 0; x < width; x++)
+        {
+            const col0 = cols[x] * 4;
+            const col1 = Math.min(cols[x] + 1, srcWidth - 1) * 4;
+            const tx = colFrac[x];
+            const outIndex = (y * width + x) * 4;
+            for (let c = 0; c < 4; c++)
+            {
+                const top = src[row0 + col0 + c] * (1 - tx) + src[row0 + col1 + c] * tx;
+                const bottom = src[row1 + col0 + c] * (1 - tx) + src[row1 + col1 + c] * tx;
+                out[outIndex + c] = Math.round(top * (1 - ty) + bottom * ty);
+            }
+        }
+    }
+    return { width, height, data: out };
+}
+
+/** Combine roughness (G) and metallic (B) into one glTF metallicRoughness map. */
+export function buildMetallicRoughnessMap(roughness, metallic, invertRoughness)
+{
+    const base = roughness ?? metallic;
+    const { width, height } = base;
+    if (roughness) roughness = resampleImage(roughness, width, height, "roughness");
+    if (metallic) metallic = resampleImage(metallic, width, height, "metallic");
     const out = new Uint8Array(width * height * 4);
     for (let i = 0; i < width * height; i++)
     {
@@ -126,12 +232,13 @@ function applyTint(image, tint)
 /**
  * Blend grayscale albedo with faction material colors through the paint mask:
  * mask 0 selects material 1, mask 1 selects material 3 (the "_p3" channel).
+ * A mask at a different resolution is resampled to the albedo size first.
  */
-function blendAlbedoWithMaterials(albedo, mask, mtl1, mtl3)
+export function blendAlbedoWithMaterials(albedo, mask, mtl1, mtl3)
 {
-    if (mask && (mask.width !== albedo.width || mask.height !== albedo.height))
+    if (mask)
     {
-        throw new Error(`paint mask (${mask.width}x${mask.height}) and albedo (${albedo.width}x${albedo.height}) sizes differ`);
+        mask = resampleImage(mask, albedo.width, albedo.height, "paint mask");
     }
     const data = new Uint8Array(albedo.data);
     for (let i = 0; i < data.length; i += 4)
@@ -159,34 +266,46 @@ function buildEmissive(glow, glowColor)
 /**
  * Load and bake every texture of one ship set.
  *
- * @param {string} dir Directory containing the DDS files.
- * @param {string} stem Texture stem, e.g. "af1_t1".
+ * @param {string} stem Texture stem, e.g. "af1_t1" (used for output image names
+ *   and fallback file names when SOF provides no path for a map).
  * @param {object} [options]
+ * @param {(logical: string, resPath: string|null, fallbackName: string) => Promise<Uint8Array|null>} [options.resolveTexture]
+ *   Texture byte source. Default: `makeFileTextureResolver(options.textureDir ?? ".")`.
+ * @param {string} [options.textureDir] Directory used by the default resolver.
  * @param {boolean} [options.flipGreen] Flip normal-map green channel. Default true.
  * @param {number[]} [options.tint] RGB multiplier (0..1) applied to the albedo.
- * @param {object} [options.textureNames] Explicit file names from SOF, keyed by
+ * @param {object} [options.textureNames] Explicit `res:/` paths from SOF, keyed by
  *   logical map: albedo, normal, roughness, metallic, glow, dirt, paintMask.
  * @param {Array<number[]|null>} [options.diffuse] Mtl1..4 diffuse colors; blended
  *   through the paint mask (takes precedence over tint).
  * @param {number[]} [options.glowColor] HDR glow color; tints the emissive map
  *   and sets the emissive strength.
- * @returns {Promise<{images: Array<{name, png}>, slots: {baseColor?, normal?, metallicRoughness?, emissive?, emissiveStrength?}, skipped: string[]}>}
+ * @param {{format: "png"|"webp", quality?: number}} [options.textureFormat]
+ *   Output texture encoding. Default PNG.
+ * @returns {Promise<{images: Array<{name, data, mimeType}>, slots: {baseColor?, normal?, metallicRoughness?, emissive?, emissiveStrength?}, skipped: string[]}>}
  */
-export async function bakeTextures(dir, stem, options = {})
+export async function bakeTextures(stem, options = {})
 {
     const flipGreen = options.flipGreen !== false;
     const tint = options.tint ?? null;
     const names = options.textureNames ?? {};
-    const pick = (logical, fallback) => join(dir, names[logical] ?? `${stem}_${fallback}.dds`);
+    const resolveTexture = options.resolveTexture ?? makeFileTextureResolver(options.textureDir ?? ".");
+    const textureFormat = options.textureFormat ?? { format: "png" };
+    const load = async (logical, fallback) =>
+    {
+        const label = names[logical] ?? `${stem}_${fallback}.dds`;
+        const bytes = await resolveTexture(logical, names[logical] ?? null, label);
+        return tryDecode(bytes, label);
+    };
 
     const [albedo, normal, roughness, metallic, glow, dirt, paintMask] = await Promise.all([
-        tryRead(pick("albedo", "a")),
-        tryRead(pick("normal", "n")),
-        tryRead(pick("roughness", "r")),
-        tryRead(pick("metallic", "m")),
-        tryRead(pick("glow", "g")),
-        tryRead(pick("dirt", "d")),
-        tryRead(pick("paintMask", "p3"))
+        load("albedo", "a"),
+        load("normal", "n"),
+        load("roughness", "r"),
+        load("metallic", "m"),
+        load("glow", "g"),
+        load("dirt", "d"),
+        load("paintMask", "p3")
     ]);
 
     const skipped = [];
@@ -197,7 +316,8 @@ export async function bakeTextures(dir, stem, options = {})
 
     async function addImage(name, rgba)
     {
-        images.push({ name, png: await encodePng(rgba.width, rgba.height, rgba.data) });
+        const encoded = await encodeImage(rgba.width, rgba.height, rgba.data, textureFormat);
+        images.push({ name, data: encoded.data, mimeType: encoded.mimeType });
         return images.length - 1;
     }
 
