@@ -1,0 +1,30 @@
+{
+  "name": "carbon-gr2-to-glb",
+  "version": "1.0.0",
+  "description": "Convert EVE Online ship models (GR2 + SOF materials + DDS textures) to self-contained GLB",
+  "main": "index.js",
+  "bin": {
+    "gr2-to-glb": "./cli.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "devEngines": {
+    "packageManager": {
+      "name": "pnpm",
+      "version": "12.10.1",
+      "onFail": "download"
+    }
+  },
+  "packageManager": "pnpm@12.10.1",
+  "type": "module",
+  "dependencies": {
+    "@carbonenginejs/runtime": "0.1.0-alpha.9"
+  }
+}
