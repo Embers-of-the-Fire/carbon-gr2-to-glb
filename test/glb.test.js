@@ -82,8 +82,11 @@ test("embeds images and references them from material slots", () =>
     }
 });
 
-test("wires webp images through EXT_texture_webp and marks it required", () =>
+test("emits webp images as plain sources without EXT_texture_webp", () =>
 {
+    // App-internal contract: the EFA viewer (Flutter Scene) refuses unknown
+    // extensionsRequired, but decodes WebP payloads by content sniffing, so
+    // WebP rides as a plain image/webp source with no extension wiring.
     const png = new Uint8Array([ 0x89, 0x50, 0x4e, 0x47 ]);
     const webp = new Uint8Array([ 0x52, 0x49, 0x46, 0x46 ]);
     const glb = writeGlb({
@@ -104,10 +107,11 @@ test("wires webp images through EXT_texture_webp and marks it required", () =>
     });
 
     const { json } = parseGlb(glb);
-    assert.deepEqual(json.extensionsRequired, [ "EXT_texture_webp" ]);
-    assert.ok(json.extensionsUsed.includes("EXT_texture_webp"));
-    assert.equal(json.textures[0].source, undefined);
-    assert.deepEqual(json.textures[0].extensions, { EXT_texture_webp: { source: 0 } });
+    assert.equal(json.extensionsRequired, undefined);
+    assert.equal(json.extensionsUsed, undefined);
+    assert.equal(json.textures[0].source, 0);
+    assert.equal(json.textures[0].extensions, undefined);
+    assert.equal(json.images[0].mimeType, "image/webp");
     assert.equal(json.textures[1].source, 1);
 });
 

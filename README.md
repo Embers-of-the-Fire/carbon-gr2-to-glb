@@ -98,8 +98,8 @@ Manifest schema (see `src/batch.js`):
 ```jsonc
 {
   "dataBlack": "/path/to/data.black",
-  "texture": { "format": "webp", "quality": 90 },  // optional default
-  "geometry": "meshopt",                           // optional default
+  "texture": { "format": "webp" },   // optional default; "png" | "webp" | "none"
+  "geometry": "meshopt",             // optional default
   "jobs": [
     {
       "id": "587",                                 // opaque caller key
@@ -112,6 +112,18 @@ Manifest schema (see `src/batch.js`):
   ]
 }
 ```
+
+`texture.format: "none"` skips texture baking entirely and emits the base
+(geometry-only) variant: factor-only PBR materials derived from the SOF
+material constants (brightness-normalized hull color, glass/heat area looks),
+no images.
+
+> **WebP output is an app-internal contract.** `format: "webp"` payloads are
+> written as plain `image/webp` image sources without the `EXT_texture_webp`
+> extension wiring (the files would otherwise be refused by the EFA viewer,
+> which rejects unknown `extensionsRequired` but decodes WebP bytes by
+> content). A spec-conformant glTF toolchain may reject these files; use
+> `format: "png"` for general-purpose output.
 
 Resolved jobs report full `res:/...` paths, so assets can be staged from a
 client cache or a resource index (`resfileindex.txt`) lookup.

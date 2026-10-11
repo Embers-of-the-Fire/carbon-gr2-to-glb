@@ -2,8 +2,13 @@
  * Minimal glTF 2.0 binary (GLB) writer.
  *
  * Takes ready-made geometry and encoded images, assembles the JSON chunk
- * and a single BIN chunk, and returns the .glb bytes. WebP images are wired
- * through EXT_texture_webp (marked as required, with no lossless fallback).
+ * and a single BIN chunk, and returns the .glb bytes.
+ *
+ * WebP payloads are emitted as plain `image/webp` image sources — without the
+ * EXT_texture_webp extension wiring the glTF 2.0 spec would demand. This is a
+ * deliberate app-internal contract: the EFA viewer (Flutter Scene) rejects
+ * unknown `extensionsRequired` but decodes WebP image bytes by content
+ * sniffing (package:image). Files are meant for that consumer only.
  */
 
 const COMPONENT_FLOAT = 5126;
@@ -49,18 +54,9 @@ export function writeGlb(model)
         gltfImages.push({ name: image.name, mimeType: image.mimeType, bufferView: view });
     }
 
-    let usesWebp = false;
     for (let i = 0; i < images.length; i++)
     {
-        if (images[i].mimeType === "image/webp")
-        {
-            usesWebp = true;
-            textures.push({ name: images[i].name, sampler: 0, extensions: { EXT_texture_webp: { source: i } } });
-        }
-        else
-        {
-            textures.push({ name: images[i].name, sampler: 0, source: i });
-        }
+        textures.push({ name: images[i].name, sampler: 0, source: i });
     }
 
     const gltfMaterials = materials.map((mat) =>
@@ -183,11 +179,9 @@ export function writeGlb(model)
     {
         extensionsUsed.push("KHR_materials_emissive_strength");
     }
-    if (usesWebp) extensionsUsed.push("EXT_texture_webp");
     if (extensionsUsed.length)
     {
         gltf.extensionsUsed = extensionsUsed;
-        if (usesWebp) gltf.extensionsRequired = [ "EXT_texture_webp" ];
     }
 
     const jsonBytes = new TextEncoder().encode(JSON.stringify(gltf));

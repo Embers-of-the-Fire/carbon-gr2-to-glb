@@ -16,7 +16,7 @@
  *   "dataBlack": "/path/to/data.black",
  *   "lod": 0,                                  // optional default
  *   "boost": false,                            // optional default
- *   "texture": { "format": "webp" },                    // optional default; webp encodes per-slot policy
+ *   "texture": { "format": "webp" },                    // optional default; webp encodes per-slot policy; "none" emits the geometry-only variant
  *   "geometry": "meshopt",                            // optional default
  *   "jobs": [
  *     {
