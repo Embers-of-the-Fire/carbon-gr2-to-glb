@@ -167,8 +167,8 @@ importers:
   .:
     dependencies:
       '@carbonenginejs/runtime':
-        specifier: 0.1.0-alpha.9
-        version: 0.1.0-alpha.9
+        specifier: 0.1.0-alpha.11
+        version: 0.1.0-alpha.11
       '@gltf-transform/core':
         specifier: ^4.5.1
         version: 4.5.1
@@ -187,8 +187,8 @@ importers:
 
 packages:
 
-  '@carbonenginejs/runtime@0.1.0-alpha.9':
-    resolution: {integrity: sha512-FRk13q25uFpceGLaa3gAegg7AHNEnTP95R6MYQA1LUKVIFxCy0xtCs9EfXnJ+I8i/2V/pyV0YLuNgcyXx0qmPA==}
+  '@carbonenginejs/runtime@0.1.0-alpha.11':
+    resolution: {integrity: sha512-TJFV8LeWHevdnjntlxsaBP6CGZnlZEkwOXq9CDE04Y+DMiJ6EHx3QMJXouzNuVdT8BzL4kncVBCN5BMsZ0JFUg==}
     engines: {node: '>=18'}
 
   '@emnapi/runtime@1.11.3':
@@ -432,7 +432,7 @@ packages:
 
 snapshots:
 
-  '@carbonenginejs/runtime@0.1.0-alpha.9':
+  '@carbonenginejs/runtime@0.1.0-alpha.11':
     dependencies:
       gl-matrix: 3.4.4
       meshoptimizer: 1.3.0

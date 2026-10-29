@@ -25,7 +25,7 @@
   "packageManager": "pnpm@12.10.1",
   "type": "module",
   "dependencies": {
-    "@carbonenginejs/runtime": "0.1.0-alpha.9",
+    "@carbonenginejs/runtime": "0.1.0-alpha.11",
     "@gltf-transform/core": "^4.5.1",
     "@gltf-transform/extensions": "^4.5.1",
     "@gltf-transform/functions": "^4.5.1",
