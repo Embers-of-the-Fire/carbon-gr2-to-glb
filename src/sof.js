@@ -11,6 +11,7 @@
 import { readFile } from "node:fs/promises";
 import { basename } from "node:path";
 import { EveSOF } from "@carbonenginejs/runtime/sof";
+import { CjsBlackFormat } from "@carbonenginejs/runtime/resource/formats/black";
 import { decompressIfGzip } from "./bake.js";
 
 function constant(area, name)
@@ -35,7 +36,13 @@ export async function createSofContext(dataBlack)
     const bytes = typeof dataBlack === "string"
         ? decompressIfGzip(new Uint8Array(await readFile(dataBlack)))
         : decompressIfGzip(dataBlack);
-    return EveSOF.Create({ black: bytes });
+    // New game builds can add SOF fields the runtime schema does not know yet
+    // (e.g. EveSOFDataLogoSet.Corporation). EveSOF.Create reads bytes with
+    // strict Black settings, so decode here with unknown-field capture and
+    // hand over the object graph; unknown slots are inert for DNA builds.
+    const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+    const data = CjsBlackFormat.readPayload(buffer, { captureUnknownBlackFields: true }).object;
+    return EveSOF.Create({ black: data });
 }
 
 /**
