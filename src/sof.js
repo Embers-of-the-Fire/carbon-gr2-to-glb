@@ -6,8 +6,16 @@
  * `createSofContext` loads the catalog once; `resolveSofDna` resolves any
  * number of DNA strings against it. Texture values are full `res:/...` paths
  * so callers can resolve them against a resource index or cache.
+ *
+ * INVARIANT: the object returned by `resolveSofDna` is the converter's ONLY
+ * window into data.black — `convertShip` reads SOF/catalog data exclusively
+ * through it. The EFA data pipeline fingerprints this object
+ * (`sofShipHash`) for its models build-state cache, so any catalog data that
+ * affects GLB output must be carried on this object; extend `resolveSofDna`
+ * rather than reading the catalog elsewhere.
  */
 
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { basename } from "node:path";
 import { EveSOF } from "@carbonenginejs/runtime/sof";
@@ -43,6 +51,23 @@ export async function createSofContext(dataBlack)
     const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
     const data = CjsBlackFormat.readPayload(buffer, { captureUnknownBlackFields: true }).object;
     return EveSOF.Create({ black: data });
+}
+
+/**
+ * Content fingerprint of a resolved SOF ship: sha256 over the JSON of the
+ * exact object `convertShip` consumes. Covers every data.black-derived value
+ * that influences GLB output, so a catalog change that leaves a DNA's
+ * resolved values untouched (e.g. adding an unrelated hull) does not change
+ * the fingerprint. Stability relies on `resolveSofDna`'s fixed key/array
+ * construction order, which makes JSON.stringify of this object graph
+ * deterministic within a Node version.
+ *
+ * @param {object} sofShip Resolved SOF ship from resolveSofDna.
+ * @returns {string} Lowercase hex sha256.
+ */
+export function sofShipHash(sofShip)
+{
+    return createHash("sha256").update(JSON.stringify(sofShip)).digest("hex");
 }
 
 /**

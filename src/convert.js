@@ -243,6 +243,10 @@ export function buildAreaMaterials(sofShip, slots)
  * @param {{dataBlack: string|Uint8Array, dna: string}} [options.sof] SOF catalog + DNA for real faction data.
  * @param {object} [options.sofShip] Pre-resolved SOF ship (from resolveSofDna);
  *   takes precedence over `sof` so batch runs can share one catalog.
+ *   INVARIANT: this object is the only SOF/catalog influence on the output GLB —
+ *   the data pipeline's build-state cache fingerprints it (sofShipHash), so any
+ *   data.black data that affects the output must be carried here. Extend
+ *   resolveSofDna instead of reading the catalog elsewhere.
  * @param {{format: "png"|"webp"|"none"}} [options.textureFormat]
  *   Output texture encoding. Default PNG. WebP encodes per WEBP_ENCODING_POLICY.
  *   `"none"` skips texture baking entirely and emits the base (geometry-only)

@@ -6,10 +6,16 @@
  *
  *   1. `runBatchResolve(manifest)` — resolves every job's DNA against
  *      `data.black` (loaded once) and reports the authoritative `res:/`
- *      geometry/texture paths, without reading any asset bytes.
+ *      geometry/texture paths, without reading any asset bytes. Each job
+ *      also carries `sof` (the full resolved SOF ship) and `sofHash` (its
+ *      content fingerprint — see sof.js), which the caller uses for
+ *      build-state memoization.
  *   2. The caller stages those files locally, then
  *      `runBatch(manifest)` — converts every job fully offline, reading
- *      textures from the staged `textures` map.
+ *      textures from the staged `textures` map. A job that carries `sof`
+ *      (passed through from the resolve phase) is converted from exactly
+ *      those resolved values without re-reading the catalog; jobs without
+ *      `sof` re-resolve their DNA as a fallback.
  *
  * Manifest schema:
  * {
@@ -25,6 +31,7 @@
  *       // convert phase only:
  *       "gr2": "/staged/mf4_t1.gr2",
  *       "textures": { "res:/dx9/...": "/staged/file.dds", ... },
+ *       "sof": { ... },                        // optional: pre-resolved SOF ship from the resolve phase
  *       "out": "/out/587.glb"
  *     }
  *   ]
@@ -34,7 +41,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { basename, dirname } from "node:path";
 import { convertShip } from "./convert.js";
-import { createSofContext, resolveSofDna } from "./sof.js";
+import { createSofContext, resolveSofDna, sofShipHash } from "./sof.js";
 import { makeMappedTextureResolver } from "./bake.js";
 
 function validateManifest(manifest)
@@ -52,7 +59,7 @@ function validateManifest(manifest)
  * Resolve phase: report the asset paths every job needs.
  *
  * @param {object} manifest Batch manifest; jobs need only `id` and `dna`.
- * @returns {Promise<{jobs: Array<{id: string, dna: string, geometryResPath: string|null, textureResPaths: string[], error?: string}>}>}
+ * @returns {Promise<{jobs: Array<{id: string, dna: string, geometryResPath: string|null, textureResPaths: string[], sof: object|null, sofHash: string|null, error?: string}>}>}
  */
 export async function runBatchResolve(manifest)
 {
@@ -77,12 +84,22 @@ export async function runBatchResolve(manifest)
                 id: job.id,
                 dna: job.dna,
                 geometryResPath: sofShip.geometryResPath,
-                textureResPaths
+                textureResPaths,
+                sof: sofShip,
+                sofHash: sofShipHash(sofShip)
             });
         }
         catch (error)
         {
-            jobs.push({ id: job.id, dna: job.dna, geometryResPath: null, textureResPaths: [], error: String(error.message ?? error) });
+            jobs.push({
+                id: job.id,
+                dna: job.dna,
+                geometryResPath: null,
+                textureResPaths: [],
+                sof: null,
+                sofHash: null,
+                error: String(error.message ?? error)
+            });
         }
     }
     return { jobs };
@@ -92,14 +109,18 @@ export async function runBatchResolve(manifest)
  * Convert phase: render every job to GLB, fully offline.
  *
  * @param {object} manifest Batch manifest; jobs need `id`, `dna`, `gr2`, `out`,
- *   and `textures` (res path -> staged local file).
- * @param {{onProgress?: (job: object, stats: object) => void}} [hooks]
+ *   and `textures` (res path -> staged local file). A job may carry `sof` (the
+ *   resolved SOF ship from the resolve phase) to convert from exactly those
+ *   values without re-reading the catalog.
+ * @param {{onProgress?: (job: object, stats: object|null) => void}} [hooks]
  * @returns {Promise<{results: Array<{id: string, out?: string, stats?: object, error?: string}>}>}
  */
 export async function runBatch(manifest, hooks = {})
 {
     validateManifest(manifest);
-    const sof = await createSofContext(manifest.dataBlack);
+    // Lazily created: jobs carrying a pre-resolved `sof` never touch the catalog.
+    let sof = null;
+    const sofContext = async () => (sof ??= await createSofContext(manifest.dataBlack));
 
     const results = [];
     for (const job of manifest.jobs)
@@ -107,7 +128,7 @@ export async function runBatch(manifest, hooks = {})
         try
         {
             if (!job.gr2 || !job.out) throw new Error("convert-phase jobs require \"gr2\" and \"out\"");
-            const sofShip = await resolveSofDna(sof, job.dna);
+            const sofShip = job.sof ?? await resolveSofDna(await sofContext(), job.dna);
             const gr2Bytes = new Uint8Array(await readFile(job.gr2));
             const { glb, stats } = await convertShip(gr2Bytes, {
                 stem: basename(job.gr2).replace(/\.gr2$/i, ""),

@@ -107,11 +107,18 @@ Manifest schema (see `src/batch.js`):
       // convert phase only:
       "gr2": "/staged/mf4_t1.gr2",
       "textures": { "res:/dx9/...": "/staged/file.dds" },
+      "sof": { "...": "..." },                     // optional: pre-resolved SOF ship from phase 1
       "out": "/out/587.glb"
     }
   ]
 }
 ```
+
+Each resolve-phase job also reports `sof` (the full resolved SOF ship) and
+`sofHash` (a sha256 fingerprint of it). Passing a job's `sof` through to the
+convert phase converts from exactly those values without re-reading the
+catalog; the fingerprint lets callers memoize conversions per DNA (a catalog
+change that leaves a DNA's resolved values untouched keeps its `sofHash`).
 
 `texture.format: "none"` skips texture baking entirely and emits the base
 (geometry-only) variant: factor-only PBR materials derived from the SOF
