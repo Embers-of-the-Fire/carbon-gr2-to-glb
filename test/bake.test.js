@@ -1,6 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import sharp from "sharp";
 import {
+    applySharpConcurrencyFromEnv,
     blendAlbedoWithMaterials,
     buildMetallicRoughnessMap,
     resampleImage,
@@ -142,4 +144,23 @@ test("webp encoding policy covers every emitted texture slot", () =>
     assert.equal(WEBP_ENCODING_POLICY.normal.quality, 95);
     assert.equal(WEBP_ENCODING_POLICY.normal.smartSubsample, true);
     assert.equal(WEBP_ENCODING_POLICY.metallicRoughness.quality, 95);
+});
+
+test("applySharpConcurrencyFromEnv caps libvips threads from the env var", () =>
+{
+    const previous = sharp.concurrency();
+    try
+    {
+        applySharpConcurrencyFromEnv({ GR2_TO_GLB_SHARP_THREADS: "3" });
+        assert.equal(sharp.concurrency(), 3);
+        for (const invalid of [ {}, { GR2_TO_GLB_SHARP_THREADS: "abc" }, { GR2_TO_GLB_SHARP_THREADS: "-1" }, { GR2_TO_GLB_SHARP_THREADS: "1.5" } ])
+        {
+            applySharpConcurrencyFromEnv(invalid);
+            assert.equal(sharp.concurrency(), 3, `invalid env ${JSON.stringify(invalid)} must keep the current cap`);
+        }
+    }
+    finally
+    {
+        sharp.concurrency(previous);
+    }
 });

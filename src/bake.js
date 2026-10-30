@@ -33,6 +33,22 @@ export function decompressIfGzip(bytes)
 }
 
 /**
+ * Cap libvips' thread pool from the `GR2_TO_GLB_SHARP_THREADS` env var.
+ *
+ * sharp defaults to one libvips thread per core *per process*; pipeline
+ * sharding (multiple `cli.js --batch` processes on one machine) would
+ * otherwise oversubscribe the host. The caller computes the cap; invalid or
+ * unset values leave the sharp default untouched.
+ *
+ * @param {object} [env] Environment map (defaults to process.env).
+ */
+export function applySharpConcurrencyFromEnv(env = process.env)
+{
+    const value = Number(env.GR2_TO_GLB_SHARP_THREADS);
+    if (Number.isInteger(value) && value > 0) sharp.concurrency(value);
+}
+
+/**
  * WebP encoding policy per logical texture slot ("balanced" preset):
  * color maps that must stay crisp go lossless (the faction-blended albedo
  * compresses well anyway), data maps get high-quality lossy encoding with

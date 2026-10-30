@@ -24,6 +24,9 @@ import { readFile, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { convertShip } from "./src/convert.js";
 import { runBatch, runBatchResolve } from "./src/batch.js";
+import { applySharpConcurrencyFromEnv } from "./src/bake.js";
+
+applySharpConcurrencyFromEnv();
 
 function usage(code)
 {

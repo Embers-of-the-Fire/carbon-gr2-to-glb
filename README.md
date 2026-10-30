@@ -93,6 +93,12 @@ node cli.js --batch-resolve manifest.json --resolve-out resolved.json
 node cli.js --batch manifest.json
 ```
 
+Pipelines that shard phase 2 across several concurrent `cli.js --batch`
+processes should set `GR2_TO_GLB_SHARP_THREADS=<n>` to cap libvips' thread
+pool per process (sharp otherwise defaults to one thread per core in *every*
+process, oversubscribing the host). A reasonable value is
+`max(1, cores / processes)`.
+
 Manifest schema (see `src/batch.js`):
 
 ```jsonc
