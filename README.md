@@ -141,6 +141,44 @@ no images.
 Resolved jobs report full `res:/...` paths, so assets can be staged from a
 client cache or a resource index (`resfileindex.txt`) lookup.
 
+### Skybox mode
+
+Skybox mode bakes a scene skybox (`*_cube.dds`, a BC6H_SF16 2048x2048
+cubemap — except y01, the catalog's one LDR outlier, which is BC7 — plus
+its `EveSpaceScene` `*_cube.black` descriptor) into a 2048x1024
+Radiance `.hdr` equirect plus the metadata the app's flutter_scene viewer
+consumes. Like batch mode it never touches the network — the caller stages
+all bytes:
+
+```sh
+node cli.js --batch-skybox manifest.json --meta-out meta.json
+```
+
+Manifest schema (see `src/skybox.js`):
+
+```jsonc
+{
+  "jobs": [
+    {
+      "id": "a01",                    // opaque caller key (the skybox id)
+      "cube": "/staged/a01_cube_lowdetail.dds",
+      "black": "/staged/a01_cube.black", // optional
+      "outHdr": "/out/a01.hdr"
+    }
+  ]
+}
+```
+
+Per job, the metadata report carries the descriptor scalars
+(`nebulaIntensity`, `ambientColor`, `Tint` — omitted when the descriptor
+lacks them), `repairedPixels` (isolated BC6H decode spikes replaced by the
+neighborhood mean), and `diffuseSh`: the 9 L2 spherical-harmonic RGB
+coefficients
+(27 floats) projected in flutter_scene's exact convention, so the runtime
+never runs the SH quadrature. The equirect orientation undoes the
+left-handed → right-handed conversion the ship geometry pipeline applies
+(negated Z), so background and model reflections agree.
+
 ## What the converter does
 
 1. **Mesh** — reads the GR2 with the runtime's format readers, takes LOD0, unpacks normals from EVE's packed tangent frames, converts left-handed (EVE/DirectX) to right-handed (glTF) coordinates, and emits one glTF primitive per mesh area.
@@ -173,6 +211,7 @@ src/glb.js      minimal glTF 2.0 binary writer (EXT_texture_webp aware)
 src/compress.js optional EXT_meshopt_compression post-pass (gltf-transform)
 src/sof.js      data.black catalog queries (colors, glow, texture paths)
 src/batch.js    two-phase batch driver (resolve / convert)
+src/skybox.js   skybox bake (BC6H cube -> HDR equirect + SH + black scalars)
 ```
 
 ## License

@@ -9,6 +9,7 @@
  *               [--texture-format png|webp]
  *   node cli.js --batch-resolve <manifest.json> [--resolve-out <file>]
  *   node cli.js --batch <manifest.json>
+ *   node cli.js --batch-skybox <manifest.json> [--meta-out <file>]
  *
  * Single-file mode: textures are located by stem (<stem>_*.dds) next to the
  * input (or in --textures), or by the authoritative res:/ paths when
@@ -24,6 +25,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { convertShip } from "./src/convert.js";
 import { runBatch, runBatchResolve } from "./src/batch.js";
+import { runBatchSkybox } from "./src/skybox.js";
 import { applySharpConcurrencyFromEnv } from "./src/bake.js";
 
 applySharpConcurrencyFromEnv();
@@ -33,6 +35,7 @@ function usage(code)
     console.log(`Usage: node cli.js <input.gr2> [-o output.glb] [options]
        node cli.js --batch-resolve <manifest.json> [--resolve-out <file>]
        node cli.js --batch <manifest.json>
+       node cli.js --batch-skybox <manifest.json> [--meta-out <file>]
 
 Options:
   -o, --output <path>   Output .glb path (default: <input>.glb)
@@ -61,6 +64,9 @@ Options:
                         requires a meshopt-capable loader)
   --batch <file>        Convert-phase batch manifest (see src/batch.js)
   --batch-resolve <f>   Resolve-phase batch manifest; prints required res:/ paths
+  --batch-skybox <f>    Skybox bake manifest (see src/skybox.js); writes .hdr
+                        equirects and reports sidecar fields as JSON
+  --meta-out <file>     Write --batch-skybox metadata here instead of stdout
   --resolve-out <file>  Write --batch-resolve output here instead of stdout
   -h, --help            Show this help`);
     process.exit(code);
@@ -68,7 +74,7 @@ Options:
 
 function parseArgs(argv)
 {
-    const args = { input: null, output: null, textures: null, stem: null, lod: 0, flipV: false, flipGreen: true, convert: true, tint: null, dataBlack: null, dna: null, boost: false, invertRoughness: false, textureFormat: "png", geometryCompression: null, batch: null, batchResolve: null, resolveOut: null };
+    const args = { input: null, output: null, textures: null, stem: null, lod: 0, flipV: false, flipGreen: true, convert: true, tint: null, dataBlack: null, dna: null, boost: false, invertRoughness: false, textureFormat: "png", geometryCompression: null, batch: null, batchResolve: null, resolveOut: null, batchSkybox: null, metaOut: null };
     for (let i = 0; i < argv.length; i++)
     {
         const arg = argv[i];
@@ -98,6 +104,8 @@ function parseArgs(argv)
             case "--geometry-compression": args.geometryCompression = argv[++i]; break;
             case "--batch": args.batch = argv[++i]; break;
             case "--batch-resolve": args.batchResolve = argv[++i]; break;
+            case "--batch-skybox": args.batchSkybox = argv[++i]; break;
+            case "--meta-out": args.metaOut = argv[++i]; break;
             case "--resolve-out": args.resolveOut = argv[++i]; break;
             default:
                 if (arg.startsWith("-")) { console.error(`unknown option: ${arg}`); usage(1); }
@@ -110,7 +118,13 @@ function parseArgs(argv)
         console.error("--batch and --batch-resolve are mutually exclusive");
         process.exit(1);
     }
-    if (args.batch || args.batchResolve) return args;
+    const batchModes = [ args.batch, args.batchResolve, args.batchSkybox ].filter(Boolean);
+    if (batchModes.length > 1)
+    {
+        console.error("--batch, --batch-resolve and --batch-skybox are mutually exclusive");
+        process.exit(1);
+    }
+    if (batchModes.length) return args;
     if (!args.input) usage(1);
     if ((args.dataBlack && !args.dna) || (!args.dataBlack && args.dna))
     {
@@ -164,9 +178,32 @@ async function runBatchCli(path)
     if (failures.length) process.exitCode = 1;
 }
 
+async function runBatchSkyboxCli(path, metaOut)
+{
+    const manifest = JSON.parse(await readFile(path, "utf8"));
+    const { jobs } = await runBatchSkybox(manifest);
+    const failures = jobs.filter((job) => !job.ok);
+    const json = JSON.stringify({ jobs }, null, 2);
+    if (metaOut)
+    {
+        await writeFile(metaOut, json);
+        console.error(`baked ${jobs.length - failures.length}/${jobs.length} skyboxes -> ${metaOut}`);
+    }
+    else
+    {
+        console.log(json);
+    }
+    for (const job of failures) console.error(`error: skybox ${job.id}: ${job.error}`);
+    if (failures.length) process.exitCode = 1;
+}
+
 const args = parseArgs(process.argv.slice(2));
 
-if (args.batchResolve)
+if (args.batchSkybox)
+{
+    await runBatchSkyboxCli(resolve(args.batchSkybox), args.metaOut ? resolve(args.metaOut) : null);
+}
+else if (args.batchResolve)
 {
     await runBatchResolveCli(resolve(args.batchResolve), args.resolveOut ? resolve(args.resolveOut) : null);
 }
