@@ -253,14 +253,17 @@ test("extractSceneParameters reads the EveSpaceScene fields and omits absent one
         },
         ambientColor: [ 0.09, 0.07, 0.04, 1 ],
         nebulaIntensity: 1.25,
+        reflectionIntensity: 1.4,
         fogStart: -500000
     };
     assert.deepEqual(extractSceneParameters(scene), {
         nebulaIntensity: 1.25,
+        reflectionIntensity: 1.4,
         ambientColor: [ 0.09, 0.07, 0.04 ],
         tint: [ 1, 0.5, 0.25 ]
     });
     assert.deepEqual(extractSceneParameters({}), {});
     assert.deepEqual(extractSceneParameters({ nebulaIntensity: Number.NaN, ambientColor: [ 1, 2 ] }), {});
+    assert.deepEqual(extractSceneParameters({ reflectionIntensity: Number.NaN }), {});
     assert.deepEqual(extractSceneParameters({ backgroundEffect: null }), {});
 });

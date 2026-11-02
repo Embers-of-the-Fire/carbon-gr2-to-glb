@@ -361,9 +361,10 @@ function readColor3(value)
 
 /**
  * Extract the lighting scalars of an `EveSpaceScene` black descriptor the
- * sidecar carries: `nebulaIntensity`, `ambientColor`, and the background
- * effect's `Tint` const parameter. Absent values stay absent (never
- * zero-filled); the app substitutes its defaults.
+ * sidecar carries: `nebulaIntensity` (background), `reflectionIntensity`
+ * (image-based lighting), `ambientColor`, and the background effect's `Tint`
+ * const parameter. Absent values stay absent (never zero-filled); the app
+ * substitutes its defaults.
  */
 export function extractSceneParameters(scene)
 {
@@ -371,6 +372,10 @@ export function extractSceneParameters(scene)
     if (typeof scene?.nebulaIntensity === "number" && Number.isFinite(scene.nebulaIntensity))
     {
         out.nebulaIntensity = scene.nebulaIntensity;
+    }
+    if (typeof scene?.reflectionIntensity === "number" && Number.isFinite(scene.reflectionIntensity))
+    {
+        out.reflectionIntensity = scene.reflectionIntensity;
     }
     const ambient = readColor3(scene?.ambientColor);
     if (ambient) out.ambientColor = ambient;
