@@ -170,7 +170,7 @@ Manifest schema (see `src/skybox.js`):
 ```
 
 Per job, the metadata report carries the descriptor scalars
-(`nebulaIntensity`, `reflectionIntensity`, `ambientColor`, `Tint` — omitted
+(`nebulaIntensity`, `reflectionIntensity`, `ambientColor`, `tint` — omitted
 when the descriptor lacks them), `repairedPixels` (isolated BC6H decode
 spikes replaced by the neighborhood mean), and `diffuseSh`: the 9 L2
 spherical-harmonic RGB coefficients
