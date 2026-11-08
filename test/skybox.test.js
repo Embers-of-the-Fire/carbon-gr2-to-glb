@@ -109,6 +109,37 @@ function decodeHdrScanlines(hdr, width, height, headerLength)
     return scanlines;
 }
 
+/**
+ * Build a minimal valid Black payload whose root is `rootClassName` with no
+ * fields: FOURCC + version, a string table naming only the root class, an
+ * empty wide-string table, and a root object carrying just the class-name
+ * reference. Any schema class with no fields decodes from this.
+ */
+function makeBlackBytes(rootClassName)
+{
+    const bytes = [];
+    const pushU16 = (value) => bytes.push(value & 0xff, (value >> 8) & 0xff);
+    const pushU32 = (value) => bytes.push(
+        value & 0xff, (value >> 8) & 0xff, (value >> 16) & 0xff, (value >>> 24) & 0xff
+    );
+
+    pushU32(0xB1ACF11E); // Black FOURCC.
+    pushU32(1); // Stream version.
+    // String table: the root class name at index 0. Payload objects name
+    // their class through a u16 index into this table.
+    const stringTable = [ 1, 0, ...new TextEncoder().encode(rootClassName), 0 ];
+    pushU32(stringTable.length);
+    bytes.push(...stringTable);
+    // Wide string table: empty.
+    pushU32(2);
+    pushU16(0);
+    // Root object: reference 1, payload holding only the class-name ref.
+    pushU32(1);
+    pushU32(2);
+    pushU16(0);
+    return Uint8Array.from(bytes);
+}
+
 test("cubeToEquirect maps the engine's equirect convention onto the right faces", () =>
 {
     const width = 64;
@@ -189,6 +220,24 @@ test("bakeSkybox leaves an existing HDR untouched when the descriptor fails", as
     );
     // The prior HDR must survive byte-for-byte; only a fully computed bake
     // may replace it.
+    assert.deepEqual(new Uint8Array(await readFile(outHdr)), sentinel);
+});
+
+test("bakeSkybox rejects a valid non-EveSpaceScene Black root without touching the HDR", async () =>
+{
+    const directory = await mkdtemp(join(tmpdir(), "skybox-"));
+    const outHdr = join(directory, "existing.hdr");
+    const sentinel = new Uint8Array([ 9, 9, 9 ]);
+    await writeFile(outHdr, sentinel);
+
+    await assert.rejects(
+        bakeSkybox({
+            cubeBytes: makeCubeDdsBytes(),
+            blackBytes: makeBlackBytes("Tr2Effect"), // valid Black, wrong root
+            outHdr
+        }),
+        /expected EveSpaceScene Black root, got Tr2Effect/
+    );
     assert.deepEqual(new Uint8Array(await readFile(outHdr)), sentinel);
 });
 

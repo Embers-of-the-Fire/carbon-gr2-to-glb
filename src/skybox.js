@@ -24,7 +24,8 @@
  * quadrature — critically on the web, which has no isolates.
  */
 
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, rename, rm, writeFile } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 import { parseDDSHeader, decodeImageFloat } from "dds-ktx-parser";
 import "@carbonenginejs/runtime/trinity";
 import { CjsBlackFormat } from "@carbonenginejs/runtime/resource/formats/black";
@@ -437,8 +438,9 @@ export function extractSceneParameters(scene)
  *
  * The `.hdr` write is deliberately the last step: everything that can fail
  * (decode, descriptor parse, SH projection) happens before `outHdr` is
- * touched, so a failed job can never leave an existing HDR inconsistent
- * with its prior sidecar.
+ * touched. The bytes are written to a temporary file in `outHdr`'s directory
+ * and renamed over it, so even a mid-write failure can never leave an
+ * existing HDR empty, truncated, or inconsistent with its prior sidecar.
  */
 export async function bakeSkybox({ cubeBytes, blackBytes, outHdr })
 {
@@ -453,10 +455,25 @@ export async function bakeSkybox({ cubeBytes, blackBytes, outHdr })
     {
         const black = decompressIfGzip(blackBytes);
         const scene = CjsBlackFormat.readPayload(black, { captureUnknownBlackFields: true }).object;
+        if (scene._type !== "EveSpaceScene")
+        {
+            throw new Error(`expected EveSpaceScene Black root, got ${scene._type}`);
+        }
         parameters = extractSceneParameters(scene);
     }
 
-    await writeFile(outHdr, encodeHdr(pixels, SKYBOX_EQUIRECT_WIDTH, SKYBOX_EQUIRECT_HEIGHT));
+    const tempHdr = join(dirname(outHdr), `.${String(process.pid)}.${basename(outHdr)}.tmp`);
+    try
+    {
+        await writeFile(tempHdr, encodeHdr(pixels, SKYBOX_EQUIRECT_WIDTH, SKYBOX_EQUIRECT_HEIGHT));
+        await rename(tempHdr, outHdr);
+    }
+    catch (error)
+    {
+        // Best-effort cleanup of the temp file; the original HDR is untouched.
+        await rm(tempHdr, { force: true });
+        throw error;
+    }
     return { ...parameters, diffuseSh, repairedPixels };
 }
 
