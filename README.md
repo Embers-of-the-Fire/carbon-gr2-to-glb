@@ -179,6 +179,23 @@ never runs the SH quadrature. The equirect orientation undoes the
 left-handed → right-handed conversion the ship geometry pipeline applies
 (negated Z), so background and model reflections agree.
 
+### Scene metadata mode
+
+The data pipeline extracts preview/fitting `EveSpaceScene` descriptors without
+baking any environment assets:
+
+```sh
+node cli.js --batch-scene-metadata manifest.json --meta-out metadata.json
+```
+
+The manifest is `{ "jobs": [{ "id": "amarr", "black": "/staged/amarr.black" }] }`.
+Carbon decodes the binary Black payloads; the JSON report preserves
+`nebulaIntensity`, `reflectionIntensity`, `ambientColor`, `envMapResPath`, sun
+fields, and `backgroundEffect.resources[name=NebulaMap].resourcePath`. It does
+not read cube files or write HDR/protobuf files. The Python pipeline owns
+validation, Carbon defaults, item-preview runtime overrides, environment-id
+mapping, coordinate conversion, and protobuf assembly.
+
 ## What the converter does
 
 1. **Mesh** — reads the GR2 with the runtime's format readers, takes LOD0, unpacks normals from EVE's packed tangent frames, converts left-handed (EVE/DirectX) to right-handed (glTF) coordinates, and emits one glTF primitive per mesh area.
@@ -212,6 +229,7 @@ src/compress.js optional EXT_meshopt_compression post-pass (gltf-transform)
 src/sof.js      data.black catalog queries (colors, glow, texture paths)
 src/batch.js    two-phase batch driver (resolve / convert)
 src/skybox.js   skybox bake (BC6H cube -> HDR equirect + SH + black scalars)
+src/scene-metadata.js metadata-only Carbon Black scene extraction
 ```
 
 ## License

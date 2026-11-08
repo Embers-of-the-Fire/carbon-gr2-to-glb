@@ -4,3 +4,4 @@ export { bakeTextures, decompressIfGzip, makeFileTextureResolver, makeMappedText
 export { extractGeometry } from "./src/geometry.js";
 export { writeGlb } from "./src/glb.js";
 export { runBatch, runBatchResolve } from "./src/batch.js";
+export { extractSceneLightingMetadata, runBatchSceneMetadata } from "./src/scene-metadata.js";
