@@ -99,7 +99,9 @@ export async function runBatchSceneMetadata(manifest)
         }
         catch (error)
         {
-            results.push({ id: job.id, ok: false, error: String(error?.message ?? error) });
+            // `job` may be null/undefined (a hole in the manifest's jobs
+            // array); the failure must still be reported without rethrowing.
+            results.push({ id: job?.id, ok: false, error: String(error?.message ?? error) });
         }
     }
     return { jobs: results };

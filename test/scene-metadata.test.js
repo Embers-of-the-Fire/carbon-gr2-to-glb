@@ -138,3 +138,22 @@ test("runBatchSceneMetadata is metadata-only and reports Black decode failures",
     assert.equal(result.jobs[0].ok, false);
     assert.equal(typeof result.jobs[0].error, "string");
 });
+
+test("runBatchSceneMetadata reports a null job and continues", async () =>
+{
+    const directory = await mkdtemp(join(tmpdir(), "scene-metadata-"));
+    const black = join(directory, "scene.black");
+    await writeFile(black, makeBlackBytes("EveSpaceScene"));
+    const result = await runBatchSceneMetadata({
+        jobs: [
+            null,
+            { id: "ok", black }
+        ]
+    });
+    // The null job is reported, not thrown; the later job still runs.
+    assert.equal(result.jobs.length, 2);
+    assert.equal(result.jobs[0].id, undefined);
+    assert.equal(result.jobs[0].ok, false);
+    assert.match(result.jobs[0].error, /Cannot read properties of null/);
+    assert.deepEqual(result.jobs[1], { id: "ok", ok: true });
+});

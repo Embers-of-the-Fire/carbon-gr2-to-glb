@@ -38,9 +38,28 @@ export const SKYBOX_EQUIRECT_HEIGHT = 1024;
  * Decode the 6 level-0 faces of a DDS cubemap to linear float RGBA arrays.
  * BC6H (signed/unsigned half) covers the HDR nebula cubes; BC7 is accepted
  * for y01, the catalog's one LDR cube (radiance <= 1). dds-ktx-parser maps
- * both BC7_UNORM and BC7_UNORM_SRGB to "BC7"; y01 is UNORM (linear bytes),
- * which is what the equirect pipeline assumes.
+ * both BC7_UNORM and BC7_UNORM_SRGB to "BC7" and decodes raw bytes in both
+ * cases, so the header's sRGB flag is honored here: sRGB faces are converted
+ * to linear light immediately after decoding, before any interpolation.
  */
+/** One channel of the IEC 61966-2-1 sRGB EOTF: encoded [0,1] to linear light. */
+export function srgbToLinear(c)
+{
+    return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+}
+
+/** Convert one decoded RGBA face from sRGB to linear light (alpha untouched). */
+export function linearizeSrgbFace(face)
+{
+    for (let i = 0; i < face.length; i += 4)
+    {
+        face[i] = srgbToLinear(face[i]);
+        face[i + 1] = srgbToLinear(face[i + 1]);
+        face[i + 2] = srgbToLinear(face[i + 2]);
+    }
+    return face;
+}
+
 export function decodeCubeFaces(ddsBytes)
 {
     const info = parseDDSHeader(ddsBytes);
@@ -55,13 +74,18 @@ export function decodeCubeFaces(ddsBytes)
         throw new Error(`expected square faces, got ${info.shape.width}x${info.shape.height}`);
     }
     const size = info.shape.width;
+    // dds-ktx-parser reports the header's sRGB transfer in `srgb`; the decode
+    // itself always returns the raw (encoded) bytes, so linearize here, before
+    // bilinear interpolation in cubeToEquirect operates on the faces.
+    const srgb = info.srgb === true;
     // DDS layer order is the DirectX cubemap face order +X, -X, +Y, -Y, +Z, -Z.
     const faces = [];
     for (let face = 0; face < 6; face++)
     {
         const layer = info.layers.find((l) => l.face === face && l.level === 0);
         if (!layer) throw new Error(`cubemap is missing face ${face} level 0`);
-        faces.push(decodeImageFloat(ddsBytes, info.format, layer));
+        const decoded = decodeImageFloat(ddsBytes, info.format, layer);
+        faces.push(srgb ? linearizeSrgbFace(decoded) : decoded);
     }
     return { size, faces };
 }
@@ -155,17 +179,23 @@ export function cubeToEquirect(faces, size, width = SKYBOX_EQUIRECT_WIDTH, heigh
  * pixels with huge negative (occasionally NaN) channels; bilinear sampling
  * smears each into its 2x2 footprint, so repair runs after the remap: a
  * pixel with any negative or non-finite channel is replaced by the mean of
- * its valid 8-neighbors (longitude wraps; the poles do not). RGBE cannot
- * carry negatives or NaN, and skybox radiance is physically non-negative, so
- * a pixel with no valid neighbors becomes black. Returns the repaired pixel
- * count.
+ * its valid 8-neighbors (longitude wraps; the poles do not), where "valid"
+ * is judged against the original pixels: repairs are written back as they go,
+ * but never become donors themselves, so the result cannot depend on scan
+ * order. RGBE cannot carry negatives or NaN, and skybox radiance is
+ * physically non-negative, so a pixel with no valid neighbors becomes black.
+ * Returns the repaired pixel count.
  */
 export function repairSpikes(pixels, width, height)
 {
+    // Donor selection reads a snapshot of the input; only the repaired
+    // outputs land in `pixels`. Feeding repairs back as donors would make
+    // each result depend on the row-major scan direction.
+    const original = pixels.slice();
     const isValid = (o) =>
-        Number.isFinite(pixels[o]) && pixels[o] >= 0 &&
-        Number.isFinite(pixels[o + 1]) && pixels[o + 1] >= 0 &&
-        Number.isFinite(pixels[o + 2]) && pixels[o + 2] >= 0;
+        Number.isFinite(original[o]) && original[o] >= 0 &&
+        Number.isFinite(original[o + 1]) && original[o + 1] >= 0 &&
+        Number.isFinite(original[o + 2]) && original[o + 2] >= 0;
     let repaired = 0;
     for (let y = 0; y < height; y++)
     {
@@ -184,9 +214,9 @@ export function repairSpikes(pixels, width, height)
                     const nx = (x + dx + width) % width;
                     const no = (ny * width + nx) * 3;
                     if (!isValid(no)) continue;
-                    r += pixels[no];
-                    g += pixels[no + 1];
-                    b += pixels[no + 2];
+                    r += original[no];
+                    g += original[no + 1];
+                    b += original[no + 2];
                     n++;
                 }
             }
@@ -244,10 +274,17 @@ function rleEncodePlane(line, out)
 /**
  * Encode linear RGB float pixels (width x height, row 0 at the top) as a
  * Radiance `.hdr` (RGBE, new-style RLE, `-Y height +X width`) — the exact
- * layout flutter_scene's `decodeRadianceHdr` reads.
+ * layout flutter_scene's `decodeRadianceHdr` reads. New-style RLE scanlines
+ * only exist for widths 8..32767 (below 8 the marker collides with old-style
+ * pixel bytes; the width field is 16-bit), so other widths are rejected
+ * rather than written in a layout a Radiance reader would misdecode.
  */
 export function encodeHdr(pixels, width, height)
 {
+    if (width < 8 || width > 32767)
+    {
+        throw new Error(`equirect width ${width} is outside the Radiance RLE range [8, 32767]`);
+    }
     const header = new TextEncoder().encode(
         `#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y ${height} +X ${width}\n`
     );
@@ -256,6 +293,10 @@ export function encodeHdr(pixels, width, height)
     const rgbe = new Uint8Array(width * 4);
     for (let y = 0; y < height; y++)
     {
+        // Black pixels keep the all-zero RGBE quad; without the clear, a
+        // black pixel would re-emit the previous row's bytes for its column
+        // and streak vertically through the image.
+        rgbe.fill(0);
         for (let x = 0; x < width; x++)
         {
             const o = (y * width + x) * 3;
@@ -390,9 +431,14 @@ export function extractSceneParameters(scene)
 
 /**
  * Bake one skybox: decode the cube DDS, remap to the equirect, repair decode
- * spikes, write the `.hdr`, and return the sidecar fields (black scalars, the
- * 27 diffuse SH floats, and the repaired-pixel count). `blackBytes` may be
- * null (descriptor absent); the black fields are then simply unset.
+ * spikes, and return the sidecar fields (black scalars, the 27 diffuse SH
+ * floats, and the repaired-pixel count). `blackBytes` may be null
+ * (descriptor absent); the black fields are then simply unset.
+ *
+ * The `.hdr` write is deliberately the last step: everything that can fail
+ * (decode, descriptor parse, SH projection) happens before `outHdr` is
+ * touched, so a failed job can never leave an existing HDR inconsistent
+ * with its prior sidecar.
  */
 export async function bakeSkybox({ cubeBytes, blackBytes, outHdr })
 {
@@ -400,7 +446,6 @@ export async function bakeSkybox({ cubeBytes, blackBytes, outHdr })
     const { size, faces } = decodeCubeFaces(dds);
     const pixels = cubeToEquirect(faces, size);
     const repairedPixels = repairSpikes(pixels, SKYBOX_EQUIRECT_WIDTH, SKYBOX_EQUIRECT_HEIGHT);
-    await writeFile(outHdr, encodeHdr(pixels, SKYBOX_EQUIRECT_WIDTH, SKYBOX_EQUIRECT_HEIGHT));
     const diffuseSh = projectDiffuseSh(pixels, SKYBOX_EQUIRECT_WIDTH, SKYBOX_EQUIRECT_HEIGHT);
 
     let parameters = {};
@@ -410,6 +455,8 @@ export async function bakeSkybox({ cubeBytes, blackBytes, outHdr })
         const scene = CjsBlackFormat.readPayload(black, { captureUnknownBlackFields: true }).object;
         parameters = extractSceneParameters(scene);
     }
+
+    await writeFile(outHdr, encodeHdr(pixels, SKYBOX_EQUIRECT_WIDTH, SKYBOX_EQUIRECT_HEIGHT));
     return { ...parameters, diffuseSh, repairedPixels };
 }
 
@@ -432,7 +479,9 @@ export async function runBatchSkybox(manifest)
         }
         catch (error)
         {
-            results.push({ id: job.id, ok: false, error: String(error?.message ?? error) });
+            // `job` may be null/undefined (a hole in the manifest's jobs
+            // array); the failure must still be reported without rethrowing.
+            results.push({ id: job?.id, ok: false, error: String(error?.message ?? error) });
         }
     }
     return { jobs: results };
