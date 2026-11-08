@@ -64,11 +64,20 @@ export function extractSceneLightingMetadata(scene)
     return out;
 }
 
-/** Decode one Black payload without producing any environment assets. */
+/**
+ * Decode one Black payload without producing any environment assets. Any
+ * valid Black root that is not an EveSpaceScene is rejected, so a job staging
+ * a different Black resource fails instead of reporting success with no
+ * lighting fields.
+ */
 export function extractSceneLightingMetadataFromBlack(blackBytes)
 {
     const black = decompressIfGzip(blackBytes);
     const scene = CjsBlackFormat.readPayload(black, { captureUnknownBlackFields: true }).object;
+    if (scene._type !== "EveSpaceScene")
+    {
+        throw new Error(`expected EveSpaceScene Black root, got ${scene._type}`);
+    }
     return extractSceneLightingMetadata(scene);
 }
 

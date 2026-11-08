@@ -1,12 +1,44 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
     extractSceneLightingMetadata,
+    extractSceneLightingMetadataFromBlack,
     runBatchSceneMetadata
 } from "../src/scene-metadata.js";
+
+/**
+ * Build a minimal valid Black payload whose root is `rootClassName` with no
+ * fields: FOURCC + version, a string table naming only the root class, an
+ * empty wide-string table, and a root object carrying just the class-name
+ * reference. Any schema class with no fields decodes from this.
+ */
+function makeBlackBytes(rootClassName)
+{
+    const bytes = [];
+    const pushU16 = (value) => bytes.push(value & 0xff, (value >> 8) & 0xff);
+    const pushU32 = (value) => bytes.push(
+        value & 0xff, (value >> 8) & 0xff, (value >> 16) & 0xff, (value >>> 24) & 0xff
+    );
+
+    pushU32(0xB1ACF11E); // Black FOURCC.
+    pushU32(1); // Stream version.
+    // String table: the root class name at index 0. Payload objects name
+    // their class through a u16 index into this table.
+    const stringTable = [ 1, 0, ...new TextEncoder().encode(rootClassName), 0 ];
+    pushU32(stringTable.length);
+    bytes.push(...stringTable);
+    // Wide string table: empty.
+    pushU32(2);
+    pushU16(0);
+    // Root object: reference 1, payload holding only the class-name ref.
+    pushU32(1);
+    pushU32(2);
+    pushU16(0);
+    return Uint8Array.from(bytes);
+}
 
 test("extractSceneLightingMetadata preserves source values and NebulaMap provenance", () =>
 {
@@ -63,6 +95,28 @@ test("extractSceneLightingMetadata rejects duplicate NebulaMap resources", () =>
             ]
         }
     }), /at most one NebulaMap/);
+});
+
+test("extractSceneLightingMetadataFromBlack accepts a minimal EveSpaceScene", () =>
+{
+    assert.deepEqual(extractSceneLightingMetadataFromBlack(makeBlackBytes("EveSpaceScene")), {});
+});
+
+test("extractSceneLightingMetadataFromBlack rejects valid Black roots that are not EveSpaceScene", async () =>
+{
+    const directory = await mkdtemp(join(tmpdir(), "scene-metadata-"));
+    const other = join(directory, "effect.black");
+    await writeFile(other, makeBlackBytes("Tr2Effect"));
+    const blackBytes = new Uint8Array(await readFile(other));
+    assert.throws(
+        () => extractSceneLightingMetadataFromBlack(blackBytes),
+        /expected EveSpaceScene Black root, got Tr2Effect/);
+
+    const result = await runBatchSceneMetadata({ jobs: [ { id: "wrong-root", black: other } ] });
+    assert.equal(result.jobs.length, 1);
+    assert.equal(result.jobs[0].id, "wrong-root");
+    assert.equal(result.jobs[0].ok, false);
+    assert.match(result.jobs[0].error, /expected EveSpaceScene Black root, got Tr2Effect/);
 });
 
 test("runBatchSceneMetadata is metadata-only and reports Black decode failures", async () =>
