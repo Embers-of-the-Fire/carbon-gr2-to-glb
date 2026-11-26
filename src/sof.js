@@ -79,8 +79,13 @@ export async function resolveSofDna(sof, dna)
 {
     const values = await sof.BuildValuesFromDNA(dna);
 
-    const mesh = values.mesh;
-    if (!mesh) throw new Error(`DNA "${dna}" produced no mesh`);
+    const mesh = values?.mesh;
+    if (!mesh)
+    {
+        const error = new Error(`DNA "${dna}" produced no mesh`);
+        error.code = "NO_SOURCE_MESH";
+        throw error;
+    }
 
     const texturesOf = (area) =>
     {
@@ -92,10 +97,31 @@ export async function resolveSofDna(sof, dna)
         return out;
     };
 
+    // Defaults from the quad shader's declared constant buffer. SOF omits
+    // unassigned slots; the runtime binds the effect defaults in that case.
+    const materialDefaults = {
+        DiffuseColor: [ 1, 1, 1 ],
+        FresnelColor: [ 1, 1, 1 ],
+        DustDiffuseColor: [ 1, 1, 1 ],
+        Gloss: 0.4
+    };
     const materialsOf = (area) => ({
-        diffuse: [ 1, 2, 3, 4 ].map((n) => constant(area, `Mtl${n}DiffuseColor`)?.slice(0, 3) ?? null),
-        gloss: [ 1, 2, 3, 4 ].map((n) => constant(area, `Mtl${n}Gloss`)?.[0] ?? null)
+        diffuse: [ 1, 2, 3, 4 ].map((n) => constant(area, `Mtl${n}DiffuseColor`)?.slice(0, 3) ?? [ ...materialDefaults.DiffuseColor ]),
+        fresnel: [ 1, 2, 3, 4 ].map((n) => constant(area, `Mtl${n}FresnelColor`)?.slice(0, 3) ?? [ ...materialDefaults.FresnelColor ]),
+        dustDiffuse: [ 1, 2, 3, 4 ].map((n) => constant(area, `Mtl${n}DustDiffuseColor`)?.slice(0, 3) ?? [ ...materialDefaults.DustDiffuseColor ]),
+        gloss: [ 1, 2, 3, 4 ].map((n) => constant(area, `Mtl${n}Gloss`)?.[0] ?? materialDefaults.Gloss),
+        heatGlowData: [ 1, 2, 3, 4 ].map((n) => constant(area, `Mtl${n}HeatGlowData`)?.slice(0, 4) ?? null)
     });
+
+    const parametersOf = (area) =>
+    {
+        const out = {};
+        for (const parameter of area.effect?.constParameters ?? [])
+        {
+            if (parameter.name && Array.isArray(parameter.value)) out[parameter.name] = [ ...parameter.value ];
+        }
+        return out;
+    };
 
     const areas = [];
     for (const group of [ "opaqueAreas", "transparentAreas", "decalAreas", "additiveAreas", "distortionAreas", "depthAreas" ])
@@ -103,13 +129,24 @@ export async function resolveSofDna(sof, dna)
         for (const area of mesh[group] ?? [])
         {
             areas.push({
+                ordinal: areas.length,
                 group,
                 name: area.name,
                 index: area.index ?? null,
                 count: area.count ?? null,
                 shader: shaderFamily(area),
+                shaderPath: area.effect?.effectFilePath ?? null,
+                alphaCutout: area.alphaCutout === true,
+                alphaCutoff: area.alphaCutoff ?? null,
+                castsShadows: area.castsShadows ?? null,
+                generateDepthArea: area.generateDepthArea === true,
                 textures: texturesOf(area),
                 materials: materialsOf(area),
+                defaultedMaterialParameters: [ 1, 2, 3, 4 ].flatMap((n) =>
+                    Object.keys(materialDefaults).filter((name) => constant(area, `Mtl${n}${name}`) === null).map((name) => `Mtl${n}${name}`)
+                ),
+                parameters: parametersOf(area),
+                paintStrength: constant(area, "GeneralData")?.[0] ?? 1,
                 glowColor: constant(area, "GeneralGlowColor")?.slice(0, 3) ?? null,
                 heatGlowColor: constant(area, "GeneralHeatGlowColor")?.slice(0, 3) ?? null
             });

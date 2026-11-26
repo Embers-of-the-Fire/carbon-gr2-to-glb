@@ -88,6 +88,17 @@ export function writeGlb(model)
             out.extensions = { KHR_materials_emissive_strength: { emissiveStrength: mat.emissiveStrength } };
         }
         if (mat.alphaMode && mat.alphaMode !== "OPAQUE") out.alphaMode = mat.alphaMode;
+        if (typeof mat.alphaCutoff === "number") out.alphaCutoff = mat.alphaCutoff;
+        if (mat.specularColor !== undefined && mat.specularColor !== null)
+        {
+            out.extensions ??= {};
+            out.extensions.KHR_materials_specular = {
+                specularFactor: mat.specularFactor ?? 1,
+                specularColorFactor: mat.specularColorFactor ?? [ 1, 1, 1 ],
+                specularColorTexture: { index: mat.specularColor }
+            };
+        }
+        if (mat.extras) out.extras = mat.extras;
         return out;
     });
 
@@ -156,11 +167,18 @@ export function writeGlb(model)
 
         const out = { attributes, indices: indexAccessor, mode: 4 };
         if (prim.material !== undefined && prim.material !== null) out.material = prim.material;
+        const extras = Object.fromEntries([
+            [ "sourceAreaIndex", prim.sourceAreaIndex ],
+            [ "sourceAreaName", prim.sourceAreaName ],
+            [ "sofAreaName", prim.sofAreaName ],
+            [ "conversionFamily", prim.conversionFamily ]
+        ].filter(([, value]) => value !== undefined && value !== null));
+        if (Object.keys(extras).length) out.extras = extras;
         gltfPrimitives.push(out);
     }
 
     const gltf = {
-        asset: { version: "2.0", generator: "carbon-gr2-to-glb" },
+        asset: { version: "2.0", generator: "carbon-gr2-to-glb", ...(model.metadata ? { extras: model.metadata } : {}) },
         scene: 0,
         scenes: [ { name: model.name ?? "scene", nodes: [ 0 ] } ],
         nodes: [ { name: model.name ?? "mesh", mesh: 0 } ],
@@ -178,6 +196,10 @@ export function writeGlb(model)
     if (gltfMaterials.some((mat) => mat.extensions?.KHR_materials_emissive_strength))
     {
         extensionsUsed.push("KHR_materials_emissive_strength");
+    }
+    if (gltfMaterials.some((mat) => mat.extensions?.KHR_materials_specular))
+    {
+        extensionsUsed.push("KHR_materials_specular");
     }
     if (extensionsUsed.length)
     {

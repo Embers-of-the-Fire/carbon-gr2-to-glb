@@ -1,7 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { CjsGr2Format } from "@carbonenginejs/runtime/resource/formats/gr2";
 import { runBatch } from "../src/batch.js";
 import { sofShipHash } from "../src/sof.js";
+import { validateGlb } from "../src/validate.js";
 
 function sofShip()
 {
@@ -22,6 +27,45 @@ function sofShip()
             }
         ]
     };
+}
+
+/** A hull area with every authoritative texture path and complete materials. */
+function fullShip()
+{
+    const ship = sofShip();
+    ship.areas[0].textures = {
+        AlbedoMap: "res:/dx9/texture/mf4_t1_a.dds",
+        NormalMap: "res:/dx9/texture/mf4_t1_n.dds",
+        RoughnessMap: "res:/dx9/texture/mf4_t1_r.dds",
+        MaterialMap: "res:/dx9/texture/mf4_t1_m.dds",
+        GlowMap: "res:/dx9/texture/mf4_t1_g.dds",
+        DirtMap: "res:/dx9/texture/mf4_t1_d.dds",
+        PaintMaskMap: "res:/dx9/texture/mf4_t1_p3.dds",
+        DustNoiseMap: "res:/dx9/texture/mf4_t1_dustnoise.dds"
+    };
+    ship.areas[0].materials = {
+        diffuse: [ [ 0.5, 0.4, 0.3 ], [ 0.5, 0.4, 0.3 ], [ 0.5, 0.4, 0.3 ], [ 0.5, 0.4, 0.3 ] ],
+        fresnel: [ [ 0.04, 0.04, 0.04 ], [ 0.04, 0.04, 0.04 ], [ 0.04, 0.04, 0.04 ], [ 0.04, 0.04, 0.04 ] ],
+        dustDiffuse: [ [ 0.045, 0.043, 0.045 ], [ 0.045, 0.043, 0.045 ], [ 0.045, 0.043, 0.045 ], [ 0.045, 0.043, 0.045 ] ],
+        gloss: [ 0.25, 0.25, 0.25, 0.25 ]
+    };
+    return ship;
+}
+
+/** One textured triangle in an `area_0` index group, matching SOF area index 0. */
+function syntheticGr2()
+{
+    return CjsGr2Format.writeShared({
+        meshes: [ {
+            name: "SyntheticShip",
+            vertex: {
+                position: new Float32Array([ 0, 0, 0, 1, 0, 0, 0, 1, 0 ]),
+                normal: new Float32Array([ 0, 0, 1, 0, 0, 1, 0, 0, 1 ]),
+                texcoord0: new Float32Array([ 0, 0, 1, 0, 0, 1 ])
+            },
+            indices: [ { name: "area_0", faces: new Uint16Array([ 0, 1, 2 ]), bytesPerIndex: 2 } ]
+        } ]
+    });
 }
 
 test("sofShipHash is stable across identical resolutions", () =>
@@ -45,6 +89,9 @@ test("sofShipHash changes with any resolved value", () =>
         (ship) => { ship.areas[0].materials.diffuse[0][0] = 0.51; },
         (ship) => { ship.areas[0].glowColor = null; },
         (ship) => { ship.areas[0].heatGlowColor = [ 2, 1, 0.5 ]; },
+        (ship) => { ship.areas[0].materials.fresnel = [ [ 0.1, 0.1, 0.1 ], null, null, null ]; },
+        (ship) => { ship.areas[0].materials.dustDiffuse = [ [ 0.01, 0.01, 0.01 ], null, null, null ]; },
+        (ship) => { ship.areas[0].parameters = { GeneralData: [ 0.75, 0, 0, 0 ] }; },
         (ship) => { ship.areas[0].shader = "skinned_quadheatv5"; },
         (ship) => { ship.areas[0].textures.AlbedoMap = "res:/dx9/texture/mf4_t1_a2.dds"; },
         (ship) => { ship.geometryResPath = "res:/dx9/model/hull/mf4_t2.gr2"; }
@@ -94,4 +141,110 @@ test("runBatch re-resolves against the catalog when a job carries no sof", async
     });
     assert.equal(results.length, 1);
     assert.match(results[0].error, /data\.black/);
+});
+
+test("runBatch marks a full job with missing textures incomplete and preserves the existing output", async (t) =>
+{
+    const directory = await mkdtemp(join(tmpdir(), "carbon-gr2-batch-"));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const gr2 = join(directory, "mf4_t1.gr2");
+    const outDir = join(directory, "out");
+    const out = join(outDir, "587.glb");
+    await writeFile(gr2, syntheticGr2());
+    await mkdir(outDir, { recursive: true });
+    const knownGood = Buffer.from("known-good glb sentinel");
+    await writeFile(out, knownGood);
+
+    const { results } = await runBatch({
+        dataBlack: "/nonexistent/data.black",
+        jobs: [
+            {
+                id: "587",
+                dna: "mf4_t1:minmatarbase:minmatar",
+                sof: fullShip(),
+                gr2,
+                textures: {},
+                out
+            }
+        ]
+    });
+
+    assert.equal(results.length, 1);
+    assert.equal(results[0].incomplete, true);
+    assert.equal(results[0].out, undefined);
+    assert.equal(results[0].stats.variant, "full");
+    assert.equal(results[0].stats.complete, false);
+    assert.ok(results[0].stats.missingInputs.some((input) => input.role === "albedo"));
+    assert.match(results[0].error, /incomplete high-quality conversion/);
+    assert.match(results[0].error, /area_hull:albedo/);
+    // The rejected job must not replace the known-good output, and the atomic
+    // write path must not leave temp files behind.
+    assert.deepEqual(await readFile(out), knownGood);
+    assert.deepEqual(await readdir(outDir), [ "587.glb" ]);
+});
+
+test("runBatch converts a base job from a pre-resolved sof end to end", async (t) =>
+{
+    const directory = await mkdtemp(join(tmpdir(), "carbon-gr2-batch-"));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const gr2 = join(directory, "mf4_t1.gr2");
+    const outDir = join(directory, "out");
+    const out = join(outDir, "587.glb");
+    await writeFile(gr2, syntheticGr2());
+
+    const { results } = await runBatch({
+        dataBlack: "/nonexistent/data.black",
+        texture: { format: "none" },
+        jobs: [
+            {
+                id: "587",
+                dna: "mf4_t1:minmatarbase:minmatar",
+                sof: sofShip(),
+                gr2,
+                textures: {},
+                out
+            }
+        ]
+    });
+
+    assert.equal(results.length, 1);
+    assert.equal(results[0].error, undefined);
+    assert.equal(results[0].out, out);
+    assert.equal(results[0].stats.variant, "base");
+    assert.equal(results[0].stats.complete, true);
+    assert.equal(results[0].stats.images.length, 0);
+    assert.deepEqual(await readdir(outDir), [ "587.glb" ]);
+    const report = await validateGlb(new Uint8Array(await readFile(out)), { variant: "base", expectedTriangles: 1 });
+    assert.equal(report.valid, true, report.errors.join("\n"));
+});
+
+test("runBatch produces byte-identical GLBs for two identical conversions", async (t) =>
+{
+    const directory = await mkdtemp(join(tmpdir(), "carbon-gr2-batch-"));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const gr2 = join(directory, "mf4_t1.gr2");
+    await writeFile(gr2, syntheticGr2());
+    const manifest = (out) => ({
+        dataBlack: "/nonexistent/data.black",
+        texture: { format: "none" },
+        jobs: [
+            {
+                id: "587",
+                dna: "mf4_t1:minmatarbase:minmatar",
+                sof: sofShip(),
+                gr2,
+                textures: {},
+                out
+            }
+        ]
+    });
+
+    const first = join(directory, "first", "587.glb");
+    const second = join(directory, "second", "587.glb");
+    const { results: firstResults } = await runBatch(manifest(first));
+    const { results: secondResults } = await runBatch(manifest(second));
+
+    assert.equal(firstResults[0].error, undefined);
+    assert.equal(secondResults[0].error, undefined);
+    assert.deepEqual(await readFile(first), await readFile(second));
 });
