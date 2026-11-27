@@ -1,19 +1,15 @@
+
 /**
- * Texture baking: EVE DDS maps to glTF PBR textures.
+ * Static texture baking: EVE DDS maps to application-supported glTF PBR maps.
  *
- * Suffix conventions observed on ship texture sets (all maps share one UV space):
- *   _a  BC7 RGBA  albedo (base color)
- *   _n  BC5 RG    normal XY (Z reconstructed; green flipped to glTF/OpenGL convention)
- *   _r  BC4 R     roughness
- *   _m  BC4 R     metallic
- *   _g  BC4 R     glow (emissive)
- *   _d  BC4 R     dirt  (unused: needs the shader's blend math)
- *   _p3 BC4 R     paint mask (unused without SOF material colors)
+ * The quad shader's MaterialMap is a four-band region selector, not metallic
+ * input. All color composition happens in linear space and is encoded to sRGB
+ * only after the source equations have been evaluated. Data maps stay linear.
  *
- * Texture bytes are obtained through a resolver callback
- * `(logical, resPath, fallbackName) => bytes | null`, so callers can serve
- * files from a local directory, a staged cache, or any other source. Output
- * encoding is configurable: PNG (lossless) or WebP (EXT_texture_webp).
+ * Carbon's dust is a second shaded layer. A single static glTF material cannot
+ * reproduce that layer's independent view-dependent response, so the bake uses
+ * the documented fixed approximation of blending its authored diffuse color at
+ * 14% of the source dirt amount (modulated by the source dust-noise alpha).
  */
 
 import { readFile } from "node:fs/promises";
@@ -22,6 +18,17 @@ import { gunzipSync } from "node:zlib";
 import { CjsDdsFormat } from "@carbonenginejs/runtime/resource/formats/dds";
 import { CjsPngFormat } from "@carbonenginejs/runtime/resource/formats/png";
 import sharp from "sharp";
+
+const REGION_CENTERS = [ 0, 1 / 3, 2 / 3, 1 ];
+const REGION_SCALE = 3.1914894580841064;
+const REGION_OFFSET = 1.0319149494171143;
+const PAINT_F0 = [ 0.038384001702070236, 0.03935199975967407, 0.03916500136256218 ];
+const DEFAULT_F0 = [ 0.04, 0.04, 0.04 ];
+// This baseline supports authored F0 values through 0.5 without texture clipping.
+export const SPECULAR_IOR = (1 + Math.SQRT1_2) / (1 - Math.SQRT1_2);
+export const SPECULAR_F0_BASELINE = ((SPECULAR_IOR - 1) / (SPECULAR_IOR + 1)) ** 2;
+const DEFAULT_DUST = [ 0.045, 0.043, 0.045 ];
+const DUST_APPROXIMATION = 0.14;
 
 export function decompressIfGzip(bytes)
 {
@@ -32,36 +39,91 @@ export function decompressIfGzip(bytes)
     return bytes;
 }
 
-/**
- * Cap libvips' thread pool from the `GR2_TO_GLB_SHARP_THREADS` env var.
- *
- * sharp defaults to one libvips thread per core *per process*; pipeline
- * sharding (multiple `cli.js --batch` processes on one machine) would
- * otherwise oversubscribe the host. The caller computes the cap; invalid or
- * unset values leave the sharp default untouched.
- *
- * @param {object} [env] Environment map (defaults to process.env).
- */
+/** Cap libvips' thread pool from GR2_TO_GLB_SHARP_THREADS. */
 export function applySharpConcurrencyFromEnv(env = process.env)
 {
     const value = Number(env.GR2_TO_GLB_SHARP_THREADS);
     if (Number.isInteger(value) && value > 0) sharp.concurrency(value);
 }
 
-/**
- * WebP encoding policy per logical texture slot ("balanced" preset):
- * color maps that must stay crisp go lossless (the faction-blended albedo
- * compresses well anyway), data maps get high-quality lossy encoding with
- * full-chroma smart subsampling where it matters (normals).
- */
+/** Full-variant policy: lossless output avoids chroma damage to data textures. */
 export const WEBP_ENCODING_POLICY = {
     baseColor: { lossless: true },
-    baseColorDetail: { lossless: true },
-    normal: { quality: 95, smartSubsample: true },
-    metallicRoughness: { quality: 95 },
-    emissive: { lossless: true },
-    emissiveHeat: { lossless: true }
+    normal: { lossless: true },
+    metallicRoughness: { lossless: true },
+    specularColor: { lossless: true },
+    emissive: { lossless: true }
 };
+
+/** Reconstruct the source quad shader's four material-region weights. */
+export function materialRegionWeights(selector)
+{
+    const weights = REGION_CENTERS.map((center) =>
+        Math.min(1, Math.max(0, REGION_OFFSET - Math.abs((selector - center) * REGION_SCALE)))
+    );
+    const total = Math.max(weights.reduce((sum, value) => sum + value, 0), 0.001);
+    return weights.map((value) => value / total);
+}
+
+export function srgbToLinear(value)
+{
+    return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+}
+
+export function linearToSrgb(value)
+{
+    const clamped = Math.min(1, Math.max(0, value));
+    if (clamped === 0 || clamped === 1) return clamped;
+    return clamped <= 0.0031308 ? clamped * 12.92 : 1.055 * clamped ** (1 / 2.4) - 0.055;
+}
+
+function encodeSrgb(value)
+{
+    return Math.round(linearToSrgb(value) * 255);
+}
+
+function encodeLinear(value)
+{
+    return Math.round(Math.min(1, Math.max(0, value)) * 255);
+}
+
+function encodeNormalComponent(value)
+{
+    return Math.round((Math.min(1, Math.max(-1, value)) * 0.5 + 0.5) * 255);
+}
+
+function clamp01(value)
+{
+    return Math.min(1, Math.max(0, value));
+}
+
+function mix(a, b, amount)
+{
+    return a * (1 - amount) + b * amount;
+}
+
+function mixColor(a, b, amount)
+{
+    return a.map((value, index) => mix(value, b[index], amount));
+}
+
+function weightedColor(weights, colors, fallback)
+{
+    const out = [ 0, 0, 0 ];
+    for (let region = 0; region < 4; region++)
+    {
+        const color = colors?.[region] ?? fallback;
+        for (let channel = 0; channel < 3; channel++) out[channel] += weights[region] * color[channel];
+    }
+    return out;
+}
+
+function weightedScalar(weights, values, fallback)
+{
+    let out = 0;
+    for (let region = 0; region < 4; region++) out += weights[region] * (values?.[region] ?? fallback);
+    return out;
+}
 
 async function decodeDdsRgba(bytes, label)
 {
@@ -80,13 +142,7 @@ async function tryDecode(bytes, label)
     return decodeDdsRgba(bytes, label);
 }
 
-/**
- * Filesystem-backed texture resolver: serves `<dir>/<basename(resPath)>` or,
- * when no SOF path is known, `<dir>/<fallbackName>`.
- *
- * @param {string} dir Directory containing the DDS files.
- * @returns {(logical: string, resPath: string|null, fallbackName: string) => Promise<Uint8Array|null>}
- */
+/** Filesystem-backed texture resolver for single-file conversions. */
 export function makeFileTextureResolver(dir)
 {
     return async (logical, resPath, fallbackName) =>
@@ -104,13 +160,7 @@ export function makeFileTextureResolver(dir)
     };
 }
 
-/**
- * Directory-map texture resolver: serves bytes from an explicit
- * `res:/... -> local path` map (e.g. a staged download cache).
- *
- * @param {Record<string, string>} files Map of full resource path to local file.
- * @returns {(logical: string, resPath: string|null, fallbackName: string) => Promise<Uint8Array|null>}
- */
+/** Resolve full res:/ paths from a staged local-file map. */
 export function makeMappedTextureResolver(files)
 {
     return async (logical, resPath) =>
@@ -125,98 +175,206 @@ async function encodeImage(width, height, data, format, logical)
 {
     if (format?.format === "webp")
     {
-        const policy = WEBP_ENCODING_POLICY[logical] ?? { quality: 90 };
+        const policy = WEBP_ENCODING_POLICY[logical] ?? { lossless: true };
         const webp = await sharp(Buffer.from(data.buffer, data.byteOffset, data.byteLength), {
             raw: { width, height, channels: 4 }
         }).webp(policy).toBuffer();
-        return { data: new Uint8Array(webp), mimeType: "image/webp" };
+        return { data: new Uint8Array(webp), mimeType: "image/webp", policy: { ...policy } };
     }
     const png = await CjsPngFormat.write({ width, height, data });
-    return { data: png instanceof Uint8Array ? png : new Uint8Array(png), mimeType: "image/png" };
-}
-
-/** Rebuild a glTF-convention RGB normal map from a BC5 (RG) DDS. */
-function buildNormalMap(image, flipGreen)
-{
-    const { width, height, data } = image;
-    const out = new Uint8Array(width * height * 4);
-    for (let i = 0; i < width * height; i++)
-    {
-        const x = data[i * 4] / 255 * 2 - 1;
-        let y = data[i * 4 + 1] / 255 * 2 - 1;
-        if (flipGreen) y = -y;
-        const z = Math.sqrt(Math.max(0, 1 - x * x - y * y));
-        out[i * 4] = Math.round((x * 0.5 + 0.5) * 255);
-        out[i * 4 + 1] = Math.round((y * 0.5 + 0.5) * 255);
-        out[i * 4 + 2] = Math.round((z * 0.5 + 0.5) * 255);
-        out[i * 4 + 3] = 255;
-    }
-    return { width, height, data: out };
+    return {
+        data: png instanceof Uint8Array ? png : new Uint8Array(png),
+        mimeType: "image/png",
+        policy: { lossless: true }
+    };
 }
 
 /**
- * Bilinear resample of an RGBA map to a target size.
- *
- * EVE texture sets all share one UV space, so a map may ship at a lower
- * resolution than the rest (paint masks are commonly half the albedo size);
- * resampling keeps every map texel-aligned instead of failing the conversion.
- * Returns the input object untouched when the size already matches.
- *
- * @param {{width: number, height: number, data: Uint8Array}} image
- * @param {number} width Target width.
- * @param {number} height Target height.
- * @param {string} [label] Map name used in the resample warning.
- * @returns {{width: number, height: number, data: Uint8Array}}
+ * Rebuild a glTF RGB normal from Carbon's BC5 XY. Carbon adds 0.002 before
+ * expanding XY to [-1, 1]. Authored tangent frames are retained by the geometry
+ * exporter, so the default is to preserve green rather than flipping it again.
  */
+export function buildNormalMap(image, flipGreen = false, diagnostics = {}, detailLayers = [])
+{
+    const { width, height, data } = image;
+    const out = new Uint8Array(width * height * 4);
+    let clampedZ = 0;
+    for (let i = 0; i < width * height; i++)
+    {
+        let x = (data[i * 4] / 255 + 0.002) * 2 - 1;
+        let y = (data[i * 4 + 1] / 255 + 0.002) * 2 - 1;
+        const pixelX = i % width;
+        const pixelY = Math.floor(i / width);
+        for (const layer of detailLayers)
+        {
+            const texel = sampleRepeated(layer.image, (pixelX + 0.5) / width * layer.tiling, (pixelY + 0.5) / height * layer.tiling);
+            const regionWeight = layer.selectorMap
+                ? weightedScalar(materialRegionWeights(layer.selectorMap.data[i * 4] / 255), layer.regionStrengths, 1)
+                : 1;
+            const amount = clamp01(texel[3] / 255 * layer.weight * regionWeight);
+            const detailX = (texel[0] / 255 + 0.002) * 2 - 1;
+            const detailY = (texel[1] / 255 + 0.002) * 2 - 1;
+            x = mix(x, detailX, amount);
+            y = mix(y, detailY, amount);
+        }
+        if (flipGreen) y = -y;
+        const remainder = 1 - x * x - y * y;
+        if (remainder < 0) clampedZ++;
+        const z = Math.sqrt(Math.max(0, remainder));
+        out[i * 4] = encodeNormalComponent(x);
+        out[i * 4 + 1] = encodeNormalComponent(y);
+        out[i * 4 + 2] = encodeNormalComponent(z);
+        out[i * 4 + 3] = 255;
+    }
+    diagnostics.flipGreen = flipGreen;
+    diagnostics.sourceBias = 0.002;
+    diagnostics.detailLayers = detailLayers.map((layer) => ({
+        tiling: layer.tiling,
+        weight: layer.weight,
+        regionStrengths: layer.regionStrengths ?? null
+    }));
+    diagnostics.clampedZ = (diagnostics.clampedZ ?? 0) + clampedZ;
+    return { width, height, data: out };
+}
+
+/** Bilinear resampling used only to align maps for per-texel composition. */
 export function resampleImage(image, width, height, label)
 {
     if (image.width === width && image.height === height) return image;
-    console.warn(
-        `resampled ${label ?? "map"} ${image.width}x${image.height} -> ${width}x${height}`
-    );
     const srcWidth = image.width;
     const srcHeight = image.height;
     const src = image.data;
     const out = new Uint8Array(width * height * 4);
-    const cols = new Int32Array(width);
-    const colFrac = new Float32Array(width);
-    for (let x = 0; x < width; x++)
-    {
-        const fx = Math.min(Math.max((x + 0.5) * srcWidth / width - 0.5, 0), srcWidth - 1);
-        cols[x] = Math.floor(fx);
-        colFrac[x] = fx - cols[x];
-    }
-    const rows = new Int32Array(height);
-    const rowFrac = new Float32Array(height);
     for (let y = 0; y < height; y++)
     {
         const fy = Math.min(Math.max((y + 0.5) * srcHeight / height - 0.5, 0), srcHeight - 1);
-        rows[y] = Math.floor(fy);
-        rowFrac[y] = fy - rows[y];
-    }
-    for (let y = 0; y < height; y++)
-    {
-        const row0 = rows[y] * srcWidth * 4;
-        const row1 = Math.min(rows[y] + 1, srcHeight - 1) * srcWidth * 4;
-        const ty = rowFrac[y];
+        const y0 = Math.floor(fy);
+        const y1 = Math.min(y0 + 1, srcHeight - 1);
+        const ty = fy - y0;
         for (let x = 0; x < width; x++)
         {
-            const col0 = cols[x] * 4;
-            const col1 = Math.min(cols[x] + 1, srcWidth - 1) * 4;
-            const tx = colFrac[x];
+            const fx = Math.min(Math.max((x + 0.5) * srcWidth / width - 0.5, 0), srcWidth - 1);
+            const x0 = Math.floor(fx);
+            const x1 = Math.min(x0 + 1, srcWidth - 1);
+            const tx = fx - x0;
             const outIndex = (y * width + x) * 4;
             for (let c = 0; c < 4; c++)
             {
-                const top = src[row0 + col0 + c] * (1 - tx) + src[row0 + col1 + c] * tx;
-                const bottom = src[row1 + col0 + c] * (1 - tx) + src[row1 + col1 + c] * tx;
+                const top = src[(y0 * srcWidth + x0) * 4 + c] * (1 - tx) + src[(y0 * srcWidth + x1) * 4 + c] * tx;
+                const bottom = src[(y1 * srcWidth + x0) * 4 + c] * (1 - tx) + src[(y1 * srcWidth + x1) * 4 + c] * tx;
                 out[outIndex + c] = Math.round(top * (1 - ty) + bottom * ty);
             }
         }
     }
-    return { width, height, data: out };
+    return { width, height, data: out, resampledFrom: `${label ?? "map"}:${srcWidth}x${srcHeight}` };
 }
 
-/** Combine roughness (G) and metallic (B) into one glTF metallicRoughness map. */
+function sampleRepeated(image, u, v)
+{
+    const wrap = (value) => ((value % 1) + 1) % 1;
+    const x = Math.min(image.width - 1, Math.floor(wrap(u) * image.width));
+    const y = Math.min(image.height - 1, Math.floor(wrap(v) * image.height));
+    const offset = (y * image.width + x) * 4;
+    return image.data.subarray(offset, offset + 4);
+}
+
+function aligned(image, width, height, label, records)
+{
+    if (!image || image.width === width && image.height === height) return image;
+    records.push({
+        role: label,
+        source: `${image.width}x${image.height}`,
+        output: `${width}x${height}`,
+        reason: "per-texel composition alignment"
+    });
+    return resampleImage(image, width, height, label);
+}
+
+/**
+ * Bake base color, roughness and source-F0 maps from the static quad equations.
+ * Exported for deterministic synthetic tests; input maps must already align.
+ */
+export function bakeQuadAppearance({ albedo, material, paintMask, roughness, dirt, dustNoise }, materials, options = {})
+{
+    if (!albedo || !material || !paintMask || !roughness || !dirt)
+    {
+        throw new Error("quad appearance requires albedo, material, paint, roughness and dirt maps");
+    }
+    const { width, height } = albedo;
+    for (const [name, image] of Object.entries({ material, paintMask, roughness, dirt }))
+    {
+        if (image.width !== width || image.height !== height) throw new Error(`${name} must align with albedo before baking`);
+    }
+    const baseColor = new Uint8Array(width * height * 4);
+    const metallicRoughness = new Uint8Array(width * height * 4);
+    const specularColor = new Uint8Array(width * height * 4);
+    const paintStrength = options.paintStrength ?? 1;
+    const detail = options.detail ?? null;
+    const detailTiling = options.detailTiling ?? 1;
+    for (let pixel = 0; pixel < width * height; pixel++)
+    {
+        const offset = pixel * 4;
+        const selector = material.data[offset] / 255;
+        const weights = materialRegionWeights(selector);
+        const paint = clamp01(paintMask.data[offset] / 255 * paintStrength);
+        const dirtAmount = dirt.data[offset] / 255;
+        const x = pixel % width;
+        const y = Math.floor(pixel / width);
+        const noise = dustNoise ? sampleRepeated(dustNoise, (x + 0.5) / width * 20, (y + 0.5) / height * 20) : null;
+        const dustWeight = clamp01(dirtAmount * (noise ? noise[3] / 255 + 0.5 : 1) * DUST_APPROXIMATION);
+        const diffuse = weightedColor(weights, materials.diffuse, [ 1, 1, 1 ]);
+        const dustDiffuse = weightedColor(weights, materials.dustDiffuse, DEFAULT_DUST);
+        const dustyDiffuse = mixColor(diffuse, dustDiffuse, dustWeight);
+        const surfaceDiffuse = mixColor(dustyDiffuse, [ 1, 1, 1 ], paint);
+        const fresnel = weightedColor(weights, materials.fresnel, DEFAULT_F0);
+        const f0 = mixColor(fresnel, PAINT_F0, paint);
+        const gloss = weightedScalar(weights, materials.gloss, 0.5);
+        const reflectivity = roughness.data[offset] / 255;
+        const rough = clamp01(1 - mix(reflectivity * gloss, 0.4, paint));
+        let detailMultiplier = 1;
+        if (detail)
+        {
+            const texel = sampleRepeated(detail, (x + 0.5) / width * detailTiling, (y + 0.5) / height * detailTiling);
+            detailMultiplier = mix(1, texel[0] / 255, options.detailStrength ?? 1);
+        }
+        for (let channel = 0; channel < 3; channel++)
+        {
+            const albedoLinear = srgbToLinear(albedo.data[offset + channel] / 255);
+            baseColor[offset + channel] = encodeSrgb(albedoLinear * surfaceDiffuse[channel] * detailMultiplier);
+            specularColor[offset + channel] = encodeSrgb(f0[channel] / SPECULAR_F0_BASELINE);
+        }
+        baseColor[offset + 3] = albedo.data[offset + 3];
+        metallicRoughness[offset] = 255;
+        metallicRoughness[offset + 1] = encodeLinear(rough);
+        metallicRoughness[offset + 2] = 0;
+        metallicRoughness[offset + 3] = 255;
+        specularColor[offset + 3] = 255;
+    }
+    return {
+        baseColor: { width, height, data: baseColor },
+        metallicRoughness: { width, height, data: metallicRoughness },
+        specularColor: { width, height, data: specularColor }
+    };
+}
+
+/** Legacy helper retained for users of the original two-color paint bake. */
+export function blendAlbedoWithMaterials(albedo, mask, mtl1, mtl3)
+{
+    if (mask) mask = resampleImage(mask, albedo.width, albedo.height, "paint mask");
+    const data = new Uint8Array(albedo.data);
+    for (let i = 0; i < data.length; i += 4)
+    {
+        const w = mask ? mask.data[i] / 255 : 0;
+        for (let c = 0; c < 3; c++)
+        {
+            const color = mtl1[c] * (1 - w) + (mtl3?.[c] ?? mtl1[c]) * w;
+            data[i + c] = Math.min(255, Math.round(data[i + c] * color));
+        }
+    }
+    return { width: albedo.width, height: albedo.height, data };
+}
+
+/** Legacy channel repacker; MaterialMap must not be passed as `metallic`. */
 export function buildMetallicRoughnessMap(roughness, metallic, invertRoughness, glossBlend)
 {
     const base = roughness ?? metallic;
@@ -247,182 +405,297 @@ export function buildMetallicRoughnessMap(roughness, metallic, invertRoughness, 
     return { width, height, data: out };
 }
 
-/** Expand a single-channel map to grayscale RGB. */
-function grayToRgb(image)
+function buildEmissive(glow, glowColor, options = {})
 {
-    const { width, height, data } = image;
+    const { width, height } = glow;
+    const color = glowColor ?? [ 1, 1, 1 ];
+    const strength = Math.max(...color, 1);
+    const normalized = color.map((value) => value / strength);
     const out = new Uint8Array(width * height * 4);
-    for (let i = 0; i < width * height; i++)
+    const heatNoise = options.heatNoise ?? null;
+    for (let pixel = 0; pixel < width * height; pixel++)
     {
-        out[i * 4] = out[i * 4 + 1] = out[i * 4 + 2] = data[i * 4];
-        out[i * 4 + 3] = 255;
-    }
-    return { width, height, data: out };
-}
-
-/** Multiply RGB in place by a faction tint (EVE ship albedos are grayscale). */
-function applyTint(image, tint)
-{
-    const data = new Uint8Array(image.data);
-    for (let i = 0; i < data.length; i += 4)
-    {
-        data[i] = Math.min(255, Math.round(data[i] * tint[0]));
-        data[i + 1] = Math.min(255, Math.round(data[i + 1] * tint[1]));
-        data[i + 2] = Math.min(255, Math.round(data[i + 2] * tint[2]));
-    }
-    return { width: image.width, height: image.height, data };
-}
-
-/**
- * Blend grayscale albedo with faction material colors through the paint mask:
- * mask 0 selects material 1, mask 1 selects material 3 (the "_p3" channel).
- * A mask at a different resolution is resampled to the albedo size first.
- */
-export function blendAlbedoWithMaterials(albedo, mask, mtl1, mtl3)
-{
-    if (mask)
-    {
-        mask = resampleImage(mask, albedo.width, albedo.height, "paint mask");
-    }
-    const data = new Uint8Array(albedo.data);
-    for (let i = 0; i < data.length; i += 4)
-    {
-        const w = mask ? mask.data[i] / 255 : 0;
-        for (let c = 0; c < 3; c++)
+        const offset = pixel * 4;
+        let mask;
+        if (heatNoise)
         {
-            const color = mtl1[c] * (1 - w) + (mtl3?.[c] ?? mtl1[c]) * w;
-            data[i + c] = Math.min(255, Math.round(data[i + c] * color));
+            const x = pixel % width;
+            const y = Math.floor(pixel / width);
+            const u = (x + 0.5) / width;
+            const v = (y + 0.5) / height;
+            const weights = options.material ? materialRegionWeights(options.material.data[offset] / 255) : [ 1, 0, 0, 0 ];
+            const heatData = [ 0, 1, 2, 3 ].map((component) => weightedScalar(
+                weights,
+                options.heatGlowData?.map((entry) => entry?.[component] ?? null),
+                [ 1, 0.025, 4, 0.002 ][component]
+            ));
+            // At fixed time zero the shader's forward/backward scrolling samples
+            // coincide, so their channel-wise products square the same texel.
+            const noise = sampleRepeated(heatNoise, u * heatData[2], v * heatData[2]);
+            const distortedU = u + ((noise[0] / 255) ** 2 - 0.5) * heatData[3];
+            const distortedV = v + ((noise[1] / 255) ** 2 - 0.5) * heatData[3];
+            const texel = sampleRepeated(glow, distortedU, distortedV);
+            mask = (texel[0] / 255) ** 2.4 * clamp01(heatData[0]);
         }
+        else
+        {
+            mask = (glow.data[offset] / 255) ** 2.4;
+        }
+        for (let channel = 0; channel < 3; channel++) out[offset + channel] = encodeSrgb(mask * normalized[channel]);
+        out[offset + 3] = 255;
     }
-    return { width: albedo.width, height: albedo.height, data };
+    return { image: { width, height, data: out }, strength };
 }
 
-/** Tint the grayscale glow map by the HDR glow color; returns color + strength. */
-function buildEmissive(glow, glowColor)
+function buildAdditiveEmissive(layer, mask, baseColor)
 {
-    const rgb = grayToRgb(glow);
-    if (!glowColor) return { image: rgb, strength: 1 };
-    const strength = Math.max(...glowColor, 1);
-    const normalized = glowColor.map((v) => v / strength);
-    return { image: applyTint(rgb, normalized), strength };
-}
-
-/** Multiply RGB in place by a grayscale detail map (e.g. sail patterns). */
-function applyDetailMap(image, detail)
-{
-    detail = resampleImage(detail, image.width, image.height, "detail map");
-    const data = new Uint8Array(image.data);
-    for (let i = 0; i < data.length; i += 4)
+    const { width, height } = layer;
+    const alignedMask = resampleImage(mask, width, height, "additive mask");
+    const color = baseColor ?? [ 1, 1, 1 ];
+    const strength = Math.max(...color, 1);
+    const normalized = color.map((value) => value / strength);
+    const emissive = new Uint8Array(width * height * 4);
+    const alpha = new Uint8Array(width * height * 4);
+    for (let pixel = 0; pixel < width * height; pixel++)
     {
-        const d = detail.data[i] / 255;
-        data[i] = Math.round(data[i] * d);
-        data[i + 1] = Math.round(data[i + 1] * d);
-        data[i + 2] = Math.round(data[i + 2] * d);
+        const offset = pixel * 4;
+        const amount = layer.data[offset] / 255 * alignedMask.data[offset] / 255;
+        for (let channel = 0; channel < 3; channel++) emissive[offset + channel] = encodeSrgb(amount * normalized[channel]);
+        emissive[offset + 3] = 255;
+        alpha[offset] = alpha[offset + 1] = alpha[offset + 2] = 0;
+        alpha[offset + 3] = encodeLinear(amount);
     }
-    return { width: image.width, height: image.height, data };
+    return {
+        emissive: { width, height, data: emissive },
+        baseColor: { width, height, data: alpha },
+        strength
+    };
 }
 
-/**
- * Load and bake every texture of one ship set.
- *
- * @param {string} stem Texture stem, e.g. "af1_t1" (used for output image names
- *   and fallback file names when SOF provides no path for a map).
- * @param {object} [options]
- * @param {(logical: string, resPath: string|null, fallbackName: string) => Promise<Uint8Array|null>} [options.resolveTexture]
- *   Texture byte source. Default: `makeFileTextureResolver(options.textureDir ?? ".")`.
- * @param {string} [options.textureDir] Directory used by the default resolver.
- * @param {boolean} [options.flipGreen] Flip normal-map green channel. Default true.
- * @param {number[]} [options.tint] RGB multiplier (0..1) applied to the albedo.
- * @param {object} [options.textureNames] Explicit `res:/` paths from SOF, keyed by
- *   logical map: albedo, normal, roughness, metallic, glow, dirt, paintMask.
- * @param {Array<number[]|null>} [options.diffuse] Mtl1..4 diffuse colors; blended
- *   through the paint mask (takes precedence over tint).
- * @param {Array<number|null>} [options.gloss] Mtl1..4 gloss factors; blended
- *   through the paint mask onto the roughness channel (roughness' = 1 - (1 - r) * gloss).
- * @param {number[]} [options.glowColor] HDR glow color; tints the emissive map
- *   and sets the emissive strength.
- * @param {number[]} [options.heatGlowColor] HDR heat glow color; when set, an
- *   additional `<stem>_heat_emissive` image is emitted for heat-shader areas
- *   (slots.emissiveHeat / slots.emissiveHeatStrength).
- * @param {string} [options.detailMap] `res:/` path of a grayscale detail map
- *   (e.g. SailsDetailMap); when set, an additional `<stem>_basecolor_detail`
- *   image with the detail multiplied in is emitted (slots.baseColorDetail).
- * @param {{format: "png"|"webp"}} [options.textureFormat]
- *   Output texture encoding. Default PNG. WebP encodes per WEBP_ENCODING_POLICY.
- * @returns {Promise<{images: Array<{name, data, mimeType}>, slots: {baseColor?, normal?, metallicRoughness?, emissive?, emissiveStrength?}, skipped: string[]}>}
- */
+const FALLBACKS = {
+    albedo: "a",
+    normal: "n",
+    roughness: "r",
+    material: "m",
+    glow: "g",
+    dirt: "d",
+    paintMask: "p3"
+};
+
+const QUAD_REQUIRED = [ "albedo", "normal", "roughness", "material", "glow", "dirt", "paintMask" ];
+
+function completeMaterialSet(materials)
+{
+    return [ "diffuse", "fresnel", "dustDiffuse", "gloss" ].every((role) =>
+        Array.isArray(materials?.[role]) && materials[role].length === 4 && materials[role].every((value) => value !== null && value !== undefined)
+    );
+}
+
+/** Load and bake one SOF area. Areas are deliberately independent. */
 export async function bakeTextures(stem, options = {})
 {
-    const flipGreen = options.flipGreen !== false;
-    const tint = options.tint ?? null;
     const names = options.textureNames ?? {};
     const resolveTexture = options.resolveTexture ?? makeFileTextureResolver(options.textureDir ?? ".");
     const textureFormat = options.textureFormat ?? { format: "png" };
-    const load = async (logical, fallback) =>
+    const family = options.family ?? "hull";
+    const additive = family === "additive";
+    const materials = options.materials ?? {
+        diffuse: options.diffuse ?? null,
+        fresnel: options.fresnel ?? null,
+        dustDiffuse: options.dustDiffuse ?? null,
+        gloss: options.gloss ?? null
+    };
+    if (options.tint && !materials.diffuse)
     {
-        const label = names[logical] ?? `${stem}_${fallback}.dds`;
+        materials.diffuse = [ options.tint, options.tint, options.tint, options.tint ];
+    }
+    const diagnostics = {
+        sourceTextures: [],
+        outputTextures: [],
+        resampled: [],
+        missing: [],
+        skipped: [],
+        approximations: [],
+        normal: {}
+    };
+    const load = async (logical, required) =>
+    {
+        const fallback = FALLBACKS[logical] ? `${options.fallbackStem ?? stem}_${FALLBACKS[logical]}.dds` : null;
+        const label = names[logical] ?? fallback;
+        if (!label)
+        {
+            if (required) diagnostics.missing.push({ role: logical, path: null, reason: "no authoritative resource path" });
+            return null;
+        }
         const bytes = await resolveTexture(logical, names[logical] ?? null, label);
-        return tryDecode(bytes, label);
+        const image = await tryDecode(bytes, label);
+        diagnostics.sourceTextures.push({
+            role: logical,
+            path: label,
+            present: image !== null,
+            width: image?.width ?? null,
+            height: image?.height ?? null,
+            colorSpace: logical === "albedo" ? "sRGB" : "linear-data"
+        });
+        if (!image && required) diagnostics.missing.push({ role: logical, path: label, reason: "texture bytes unavailable" });
+        return image;
     };
 
-    const [albedo, normal, roughness, metallic, glow, dirt, paintMask, detail] = await Promise.all([
-        load("albedo", "a"),
-        load("normal", "n"),
-        load("roughness", "r"),
-        load("metallic", "m"),
-        load("glow", "g"),
-        load("dirt", "d"),
-        load("paintMask", "p3"),
-        options.detailMap
-            ? (async () => tryDecode(await resolveTexture("detail", options.detailMap, options.detailMap), options.detailMap))()
-            : null
-    ]);
+    const strictAppearance = options.requireCompleteMaterials === true;
+    const required = additive
+        ? [ "layer1", "layerMask" ]
+        : [ ...(strictAppearance ? QUAD_REQUIRED : [ "albedo" ]), ...(strictAppearance ? [ "dustNoise" ] : []), ...((family === "heat" || family === "heatDetail") && strictAppearance ? [ "heatGlowNoise" ] : []), ...(family === "sails" ? [ "sailsDetail" ] : []), ...(family === "detail" || family === "heatDetail" ? [ "detail1", "detail2" ] : []) ];
+    const optional = additive
+        ? []
+        : [ "dustNoise", ...((family === "heat" || family === "heatDetail") ? [ "heatGlowNoise" ] : []) ];
+    const logicalNames = new Set([ ...QUAD_REQUIRED, ...required, ...optional, "detail3" ]);
+    const loaded = {};
+    await Promise.all([ ...logicalNames ].map(async (logical) =>
+    {
+        loaded[logical] = await load(logical, required.includes(logical));
+    }));
 
-    const skipped = [];
-    if (dirt) skipped.push(`${names.dirt ?? stem + "_d.dds"} (dirt; needs shader blend math)`);
+    if (!additive && options.requireCompleteMaterials === true && !completeMaterialSet(materials))
+    {
+        diagnostics.missing.push({ role: "materialParameters", path: null, reason: "four complete diffuse/Fresnel/dust/gloss slots are required" });
+    }
+    if (!additive)
+    {
+        diagnostics.approximations.push("Carbon dust's second shaded layer is represented by a fixed 14% diffuse blend; its independent view-dependent lighting is not retained.");
+        if (family === "sails") diagnostics.approximations.push("SailsDetailMap is composited at its authored static UV tiling; scroll and deformation parameters are omitted.");
+        if (family === "detail" || family === "heatDetail") diagnostics.approximations.push("Detail normal maps use their authored static masks and UV tiling; detail albedo/Fresnel overlays and animation are omitted.");
+        if (family === "heat" || family === "heatDetail") diagnostics.approximations.push("Heat glow uses the authored static glow mask, heat parameters, and heat color at a fixed engine-on frame; heat animation is omitted.");
+    }
+    else
+    {
+        diagnostics.approximations.push("Additive animation and true additive blending are approximated by a fixed emissive alpha-blended material at frame zero.");
+    }
 
     const images = [];
     const slots = {};
-
     async function addImage(name, rgba, logical)
     {
         const encoded = await encodeImage(rgba.width, rgba.height, rgba.data, textureFormat, logical);
         images.push({ name, data: encoded.data, mimeType: encoded.mimeType });
+        diagnostics.outputTextures.push({
+            role: logical,
+            name,
+            width: rgba.width,
+            height: rgba.height,
+            mimeType: encoded.mimeType,
+            encoding: encoded.policy,
+            bytes: encoded.data.byteLength
+        });
         return images.length - 1;
     }
 
-    if (albedo)
+    if (additive)
     {
-        const mtl1 = options.diffuse?.[0] ?? tint;
-        const mtl3 = options.diffuse?.[2] ?? null;
-        const blended = mtl1 ? blendAlbedoWithMaterials(albedo, paintMask, mtl1, mtl3) : albedo;
-        slots.baseColor = await addImage(`${stem}_basecolor`, blended, "baseColor");
-        if (detail)
+        if (loaded.layer1 && loaded.layerMask)
         {
-            slots.baseColorDetail = await addImage(`${stem}_basecolor_detail`, applyDetailMap(blended, detail), "baseColorDetail");
+            const baked = buildAdditiveEmissive(loaded.layer1, loaded.layerMask, options.parameters?.BaseColor?.slice(0, 3));
+            slots.baseColor = await addImage(`${stem}_additive_alpha`, baked.baseColor, "baseColor");
+            slots.emissive = await addImage(`${stem}_additive_emissive`, baked.emissive, "emissive");
+            slots.emissiveStrength = baked.strength;
         }
     }
-    else if (paintMask)
+    else
     {
-        skipped.push(`${names.paintMask ?? stem + "_p3.dds"} (paint mask; no albedo to blend into)`);
-    }
-    if (normal) slots.normal = await addImage(`${stem}_normal`, buildNormalMap(normal, flipGreen), "normal");
-    if (roughness || metallic)
-    {
-        slots.metallicRoughness = await addImage(`${stem}_mr`, buildMetallicRoughnessMap(roughness, metallic, options.invertRoughness === true, { mask: paintMask, gloss: options.gloss ?? null }), "metallicRoughness");
-    }
-    if (glow)
-    {
-        const emissive = buildEmissive(glow, options.glowColor ?? null);
-        slots.emissive = await addImage(`${stem}_emissive`, emissive.image, "emissive");
-        slots.emissiveStrength = emissive.strength;
-        if (options.heatGlowColor)
+        if (loaded.normal)
         {
-            const heat = buildEmissive(glow, options.heatGlowColor);
-            slots.emissiveHeat = await addImage(`${stem}_heat_emissive`, heat.image, "emissiveHeat");
-            slots.emissiveHeatStrength = heat.strength;
+            const hasDetail = family === "detail" || family === "heatDetail";
+            const detailMaterial = hasDetail
+                ? aligned(loaded.material, loaded.normal.width, loaded.normal.height, "detail material", diagnostics.resampled)
+                : null;
+            const detailLayers = hasDetail
+                ? [ loaded.detail1, loaded.detail2, loaded.detail3 ].flatMap((image, index) =>
+                {
+                    const data = options.parameters?.[`Detail${index + 1}Data`];
+                    if (!image || !data || data[0] <= 0) return [];
+                    return [ {
+                        image,
+                        tiling: data[0],
+                        weight: data[1] ?? 1,
+                        regionStrengths: options.parameters?.DetailSelector ?? [ 1, 1, 1, 1 ],
+                        selectorMap: detailMaterial
+                    } ];
+                })
+                : [];
+            slots.normal = await addImage(`${stem}_normal`, buildNormalMap(loaded.normal, options.flipGreen === true, diagnostics.normal, detailLayers), "normal");
+        }
+        if (loaded.albedo && loaded.material && loaded.paintMask && loaded.roughness && loaded.dirt)
+        {
+            const { width, height } = loaded.albedo;
+            const maps = {
+                albedo: loaded.albedo,
+                material: aligned(loaded.material, width, height, "material", diagnostics.resampled),
+                paintMask: aligned(loaded.paintMask, width, height, "paint mask", diagnostics.resampled),
+                roughness: aligned(loaded.roughness, width, height, "roughness", diagnostics.resampled),
+                dirt: aligned(loaded.dirt, width, height, "dirt", diagnostics.resampled),
+                dustNoise: loaded.dustNoise
+            };
+            const detail = family === "sails" ? loaded.sailsDetail : null;
+            const detailTiling = family === "sails" ? options.parameters?.SailsDetailData?.[0] ?? 1 : 1;
+            const detailStrength = family === "sails" ? options.parameters?.SailsDetailData?.[2] ?? 1 : 1;
+            const baked = bakeQuadAppearance(maps, materials, {
+                paintStrength: options.paintStrength ?? 1,
+                detail,
+                detailTiling,
+                detailStrength
+            });
+            slots.baseColor = await addImage(`${stem}_basecolor`, baked.baseColor, "baseColor");
+            slots.metallicRoughness = await addImage(`${stem}_roughness`, baked.metallicRoughness, "metallicRoughness");
+            slots.specularColor = await addImage(`${stem}_specular`, baked.specularColor, "specularColor");
+        }
+        else if (loaded.albedo && !strictAppearance)
+        {
+            const diffuse = materials.diffuse?.[0];
+            const baseColor = diffuse
+                ? {
+                    ...loaded.albedo,
+                    data: loaded.albedo.data.slice()
+                }
+                : loaded.albedo;
+            if (diffuse)
+            {
+                for (let pixel = 0; pixel < baseColor.data.length; pixel += 4)
+                {
+                    for (let channel = 0; channel < 3; channel++)
+                    {
+                        baseColor.data[pixel + channel] = encodeSrgb(
+                            srgbToLinear(baseColor.data[pixel + channel] / 255) * diffuse[channel]
+                        );
+                    }
+                }
+            }
+            slots.baseColor = await addImage(`${stem}_basecolor`, baseColor, "baseColor");
+        }
+        if (loaded.glow)
+        {
+            const glowColor = family === "heat" || family === "heatDetail"
+                ? options.heatGlowColor ?? options.glowColor
+                : options.glowColor;
+            const heat = family === "heat" || family === "heatDetail";
+            const emissive = buildEmissive(loaded.glow, glowColor, {
+                heatNoise: heat ? loaded.heatGlowNoise : null,
+                heatGlowData: heat ? materials.heatGlowData : null,
+                material: heat ? aligned(loaded.material, loaded.glow.width, loaded.glow.height, "heat material", diagnostics.resampled) : null
+            });
+            slots.emissive = await addImage(`${stem}_emissive`, emissive.image, "emissive");
+            slots.emissiveStrength = emissive.strength;
         }
     }
 
-    return { images, slots, skipped };
+    for (const logical of [ "layer2" ])
+    {
+        if (names[logical]) diagnostics.skipped.push({ role: logical, path: names[logical], reason: "dynamic layer or secondary detail is covered by the documented static approximation" });
+    }
+
+    return {
+        images,
+        slots,
+        skipped: [ ...diagnostics.skipped.map((entry) => `${entry.path ?? entry.role} (${entry.reason})`), ...diagnostics.approximations ],
+        diagnostics,
+        complete: diagnostics.missing.length === 0
+    };
 }

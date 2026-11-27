@@ -22,13 +22,14 @@
  * the convert phase runs fully offline.
  */
 
-import { readFile, writeFile } from "node:fs/promises";
+import { lstat, readFile, readdir, readlink, realpath, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { convertShip } from "./src/convert.js";
 import { runBatch, runBatchResolve } from "./src/batch.js";
 import { runBatchSkybox } from "./src/skybox.js";
 import { runBatchSceneMetadata } from "./src/scene-metadata.js";
 import { applySharpConcurrencyFromEnv } from "./src/bake.js";
+import { validateGlb } from "./src/validate.js";
 
 applySharpConcurrencyFromEnv();
 
@@ -39,14 +40,17 @@ function usage(code)
        node cli.js --batch <manifest.json>
        node cli.js --batch-skybox <manifest.json> [--meta-out <file>]
        node cli.js --batch-scene-metadata <manifest.json> [--meta-out <file>]
+       node cli.js --validate <model.glb|directory> [--stats-out <file>]
 
 Options:
   -o, --output <path>   Output .glb path (default: <input>.glb)
   --textures <dir>      Directory with the <stem>_*.dds set (default: input dir)
   --stem <name>         Texture stem override (default: input basename)
-  --lod <n>             LOD mesh index, 0 = full detail (default: 0)
+  --lod <n>             LOD rank, 0 = unsuffixed base; higher ranks follow
+                        descending thresholds (default: 0)
   --flip-v              Flip UV V coordinates (default: off; EVE UVs match glTF)
-  --no-flip-green       Keep DirectX normal-map green channel (default: flip)
+  --flip-green          Flip normal-map green for a documented source exception
+  --no-flip-green       Preserve source green with authored tangents (default)
   --no-convert          Skip left-handed to right-handed coordinate conversion
   --tint <r,g,b>        Faction color multiplier for the grayscale albedo,
                         0..1 per channel (e.g. Amarr gold: 0.85,0.65,0.35)
@@ -54,14 +58,8 @@ Options:
   --dna <h:f:r>         SOF DNA string, e.g. af1_t1:amarrbase:amarr.
                         With --data-black this pulls real faction colors,
                         glow color/strength and texture paths from the catalog.
-  --no-boost            Keep data-faithful faction color brightness (default).
-  --boost               Normalize faction-color brightness to the raw albedo
-                        luminance (for viewers with weak lighting)
-  --invert-roughness    Treat the _r map as smoothness (roughness = 1 - value)
-  --texture-format <f>  Embedded texture format: png (default) or webp
-                        (EXT_texture_webp; requires WebP-capable loaders).
-                        WebP encodes per-slot: lossless color/emissive maps,
-                        q95 (+smart subsample on normals) for data maps.
+  --texture-format <f>  Embedded texture format: png (default), lossless webp,
+                        or none for the explicit factor-only lightweight variant.
   --geometry-compression <c>
                         Geometry compression: meshopt (EXT_meshopt_compression;
                         requires a meshopt-capable loader)
@@ -74,13 +72,16 @@ Options:
                         src/scene-metadata.js); writes no environment assets
   --meta-out <file>     Write batch skybox/scene metadata here instead of stdout
   --resolve-out <file>  Write --batch-resolve output here instead of stdout
+  --stats-out <file>    Write --batch conversion or --validate diagnostics as JSON
+  --validate <path>     Independently parse and validate a GLB or directory tree
+  --variant <full|base> Variant expected by --validate (default: full)
   -h, --help            Show this help`);
     process.exit(code);
 }
 
 function parseArgs(argv)
 {
-    const args = { input: null, output: null, textures: null, stem: null, lod: 0, flipV: false, flipGreen: true, convert: true, tint: null, dataBlack: null, dna: null, boost: false, invertRoughness: false, textureFormat: "png", geometryCompression: null, batch: null, batchResolve: null, resolveOut: null, batchSkybox: null, batchSceneMetadata: null, metaOut: null };
+    const args = { input: null, output: null, textures: null, stem: null, lod: 0, flipV: false, flipGreen: false, convert: true, tint: null, dataBlack: null, dna: null, textureFormat: "png", geometryCompression: null, batch: null, batchResolve: null, resolveOut: null, statsOut: null, validate: null, validateVariant: "full", batchSkybox: null, batchSceneMetadata: null, metaOut: null };
     for (let i = 0; i < argv.length; i++)
     {
         const arg = argv[i];
@@ -92,6 +93,7 @@ function parseArgs(argv)
             case "--stem": args.stem = argv[++i]; break;
             case "--lod": args.lod = Number(argv[++i]); break;
             case "--flip-v": args.flipV = true; break;
+            case "--flip-green": args.flipGreen = true; break;
             case "--no-flip-green": args.flipGreen = false; break;
             case "--no-convert": args.convert = false; break;
             case "--tint":
@@ -104,8 +106,6 @@ function parseArgs(argv)
                 break;
             case "--data-black": args.dataBlack = argv[++i]; break;
             case "--dna": args.dna = argv[++i]; break;
-            case "--boost": args.boost = true; break;
-            case "--invert-roughness": args.invertRoughness = true; break;
             case "--texture-format": args.textureFormat = argv[++i]; break;
             case "--geometry-compression": args.geometryCompression = argv[++i]; break;
             case "--batch": args.batch = argv[++i]; break;
@@ -114,6 +114,9 @@ function parseArgs(argv)
             case "--batch-scene-metadata": args.batchSceneMetadata = argv[++i]; break;
             case "--meta-out": args.metaOut = argv[++i]; break;
             case "--resolve-out": args.resolveOut = argv[++i]; break;
+            case "--stats-out": args.statsOut = argv[++i]; break;
+            case "--validate": args.validate = argv[++i]; break;
+            case "--variant": args.validateVariant = argv[++i]; break;
             default:
                 if (arg.startsWith("-")) { console.error(`unknown option: ${arg}`); usage(1); }
                 if (args.input) { console.error("only one input file is supported"); usage(1); }
@@ -125,10 +128,15 @@ function parseArgs(argv)
         console.error("--batch and --batch-resolve are mutually exclusive");
         process.exit(1);
     }
-    const batchModes = [ args.batch, args.batchResolve, args.batchSkybox, args.batchSceneMetadata ].filter(Boolean);
+    const batchModes = [ args.batch, args.batchResolve, args.batchSkybox, args.batchSceneMetadata, args.validate ].filter(Boolean);
     if (batchModes.length > 1)
     {
-        console.error("--batch, --batch-resolve, --batch-skybox and --batch-scene-metadata are mutually exclusive");
+        console.error("--batch, --batch-resolve, --batch-skybox, --batch-scene-metadata and --validate are mutually exclusive");
+        process.exit(1);
+    }
+    if (args.validate && ![ "full", "base" ].includes(args.validateVariant))
+    {
+        console.error("--variant must be full or base");
         process.exit(1);
     }
     if (batchModes.length) return args;
@@ -139,8 +147,9 @@ function parseArgs(argv)
         process.exit(1);
     }
     if (!Number.isInteger(args.lod) || args.lod < 0) { console.error("--lod must be a non-negative integer"); process.exit(1); }
-    if (![ "png", "webp" ].includes(args.textureFormat)) { console.error("--texture-format must be png or webp"); process.exit(1); }
+    if (![ "png", "webp", "none" ].includes(args.textureFormat)) { console.error("--texture-format must be png, webp or none"); process.exit(1); }
     if (args.geometryCompression !== null && args.geometryCompression !== "meshopt") { console.error("--geometry-compression must be meshopt"); process.exit(1); }
+    if (![ "full", "base" ].includes(args.validateVariant)) { console.error("--variant must be full or base"); process.exit(1); }
     return args;
 }
 
@@ -163,9 +172,10 @@ async function runBatchResolveCli(path, resolveOut)
     if (failures.length) process.exitCode = 1;
 }
 
-async function runBatchCli(path)
+async function runBatchCli(path, statsOut)
 {
     const manifest = JSON.parse(await readFile(path, "utf8"));
+    await assertReportPathDoesNotCollide(statsOut, (manifest.jobs ?? []).map((job) => job.out).filter(Boolean));
     const { results } = await runBatch(manifest, {
         onProgress: (job, stats) =>
         {
@@ -180,6 +190,11 @@ async function runBatchCli(path)
         }
     });
     const failures = results.filter((result) => result.error);
+    if (statsOut)
+    {
+        await writeFile(statsOut, JSON.stringify({ results }, null, 2));
+        console.error(`wrote conversion diagnostics -> ${statsOut}`);
+    }
     for (const result of failures) console.error(`error: job ${result.id}: ${result.error}`);
     console.error(`converted ${results.length - failures.length}/${results.length} jobs`);
     if (failures.length) process.exitCode = 1;
@@ -223,9 +238,117 @@ async function runBatchSceneMetadataCli(path, metaOut)
     if (failures.length) process.exitCode = 1;
 }
 
+async function collectGlbFiles(path)
+{
+    const info = await stat(path);
+    if (info.isFile()) return path.toLowerCase().endsWith(".glb") ? [ path ] : [];
+    if (!info.isDirectory()) return [];
+    const files = [];
+    for (const entry of await readdir(path, { withFileTypes: true }))
+    {
+        if (entry.isDirectory()) files.push(...await collectGlbFiles(join(path, entry.name)));
+        else if (entry.isFile() && entry.name.toLowerCase().endsWith(".glb")) files.push(join(path, entry.name));
+    }
+    return files.sort();
+}
+
+async function canonicalPath(path)
+{
+    try
+    {
+        return await realpath(path);
+    }
+    catch (error)
+    {
+        if (error.code !== "ENOENT") throw error;
+        const absolute = resolve(path);
+        const info = await lstat(absolute).catch((error) =>
+        {
+            if (error.code !== "ENOENT") throw error;
+            return null;
+        });
+        if (info?.isSymbolicLink())
+        {
+            // realpath cannot follow a link whose target does not exist yet.
+            // Resolve relative targets from the canonical containing directory,
+            // since the path to that directory may itself traverse symlinks.
+            const linkTarget = await readlink(absolute);
+            const linkDirectory = await canonicalPath(dirname(absolute));
+            return canonicalPath(resolve(linkDirectory, linkTarget));
+        }
+        const parent = dirname(absolute);
+        if (parent === absolute) throw error;
+        return join(await canonicalPath(parent), basename(absolute));
+    }
+}
+
+async function assertReportPathDoesNotCollide(reportPath, artifactPaths)
+{
+    if (!reportPath) return;
+    const report = await canonicalPath(reportPath);
+    const reportInfo = await stat(reportPath).catch((error) =>
+    {
+        if (error.code !== "ENOENT") throw error;
+        return null;
+    });
+    for (const artifact of artifactPaths)
+    {
+        const artifactCanonical = await canonicalPath(artifact);
+        const artifactInfo = await stat(artifact).catch((error) =>
+        {
+            if (error.code !== "ENOENT") throw error;
+            return null;
+        });
+        if (artifactCanonical === report ||
+            (reportInfo && artifactInfo && reportInfo.dev === artifactInfo.dev && reportInfo.ino === artifactInfo.ino))
+        {
+            throw new Error(`statistics path ${reportPath} conflicts with artifact ${artifact}`);
+        }
+    }
+}
+
+async function runValidateCli(path, statsOut, variant)
+{
+    const files = await collectGlbFiles(path);
+    if (!files.length) throw new Error(`no .glb files found under ${path}`);
+    await assertReportPathDoesNotCollide(statsOut, files);
+    const results = [];
+    for (const file of files)
+    {
+        let report;
+        try
+        {
+            report = await validateGlb(new Uint8Array(await readFile(file)), {
+                variant,
+                maxTextureSize: 2048
+            });
+        }
+        catch (error)
+        {
+            report = {
+                valid: false,
+                errors: [ `failed to read GLB: ${error.message ?? error}` ],
+                warnings: [],
+                stats: { bytes: 0 }
+            };
+        }
+        results.push({ path: file, ...report });
+        for (const warning of report.warnings) console.error(`warning: ${file}: ${warning}`);
+        for (const error of report.errors) console.error(`error: ${file}: ${error}`);
+    }
+    const complete = results.every((result) => result.valid);
+    if (statsOut) await writeFile(statsOut, JSON.stringify({ complete, results }, null, 2));
+    console.error(`validated ${results.filter((result) => result.valid).length}/${results.length} GLBs`);
+    if (!complete) process.exitCode = 1;
+}
+
 const args = parseArgs(process.argv.slice(2));
 
-if (args.batchSceneMetadata)
+if (args.validate)
+{
+    await runValidateCli(resolve(args.validate), args.statsOut ? resolve(args.statsOut) : null, args.validateVariant);
+}
+else if (args.batchSceneMetadata)
 {
     await runBatchSceneMetadataCli(resolve(args.batchSceneMetadata), args.metaOut ? resolve(args.metaOut) : null);
 }
@@ -239,7 +362,7 @@ else if (args.batchResolve)
 }
 else if (args.batch)
 {
-    await runBatchCli(resolve(args.batch));
+    await runBatchCli(resolve(args.batch), args.statsOut ? resolve(args.statsOut) : null);
 }
 else
 {
@@ -258,19 +381,26 @@ else
         flipV: args.flipV,
         flipGreen: args.flipGreen,
         tint: args.tint,
-        boost: args.boost,
-        invertRoughness: args.invertRoughness,
         textureFormat: { format: args.textureFormat },
         geometryCompression: args.geometryCompression ?? undefined,
         sof: args.dataBlack ? { dataBlack: resolve(args.dataBlack), dna: args.dna } : undefined
     });
 
-    await writeFile(output, glb);
+    if (stats.variant === "full" && !stats.complete)
+    {
+        for (const missing of stats.missingInputs) console.error(`missing: ${missing.area ?? "unknown"} ${missing.role ?? "input"}: ${missing.reason}`);
+        console.error("refusing to replace the high-quality artifact with an incomplete conversion");
+        process.exitCode = 1;
+    }
+    else
+    {
+        await writeFile(output, glb);
+        console.log(`wrote ${output} (${(glb.byteLength / 1024 / 1024).toFixed(2)} MiB)`);
+    }
 
     console.log(`${stats.mesh} (LOD ${stats.lod} of ${stats.lodsAvailable}): ${stats.vertices} vertices, ${stats.triangles} triangles, ${stats.primitives} primitives`);
     if (stats.dna) console.log(`dna: ${stats.dna} (hull shader: ${stats.shader})`);
     console.log(`materials: ${stats.materials.join(", ")}`);
     console.log(`textures: ${stats.images.length ? stats.images.join(", ") : "none found"}`);
     for (const skipped of stats.skippedTextures) console.log(`skipped: ${skipped}`);
-    console.log(`wrote ${output} (${(glb.byteLength / 1024 / 1024).toFixed(2)} MiB)`);
 }

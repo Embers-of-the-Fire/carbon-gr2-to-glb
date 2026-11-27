@@ -21,7 +21,6 @@
  * {
  *   "dataBlack": "/path/to/data.black",
  *   "lod": 0,                                  // optional default
- *   "boost": false,                            // optional default
  *   "texture": { "format": "webp" },                    // optional default; webp encodes per-slot policy; "none" emits the geometry-only variant
  *   "geometry": "meshopt",                            // optional default
  *   "jobs": [
@@ -38,8 +37,9 @@
  * }
  */
 
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { basename, dirname } from "node:path";
+import { chmod, lstat, mkdir, readFile, readlink, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { basename, dirname, join, resolve } from "node:path";
 import { convertShip } from "./convert.js";
 import { createSofContext, resolveSofDna, sofShipHash } from "./sof.js";
 import { makeMappedTextureResolver } from "./bake.js";
@@ -98,7 +98,8 @@ export async function runBatchResolve(manifest)
                 textureResPaths: [],
                 sof: null,
                 sofHash: null,
-                error: String(error.message ?? error)
+                error: String(error.message ?? error),
+                errorCode: error.code ?? "RESOLVE_FAILED"
             });
         }
     }
@@ -135,14 +136,63 @@ export async function runBatch(manifest, hooks = {})
                 resolveTexture: makeMappedTextureResolver(job.textures ?? {}),
                 sofShip,
                 lod: job.lod ?? manifest.lod,
-                boost: job.boost ?? manifest.boost,
                 flipGreen: job.flipGreen ?? manifest.flipGreen,
-                invertRoughness: job.invertRoughness ?? manifest.invertRoughness,
+                normalY: job.normalY ?? manifest.normalY,
+                areaNormalY: job.areaNormalY ?? manifest.areaNormalY,
                 textureFormat: job.texture ?? manifest.texture,
                 geometryCompression: job.geometry ?? manifest.geometry
             });
-            await mkdir(dirname(job.out), { recursive: true });
-            await writeFile(job.out, glb);
+            if (stats.variant === "full" && !stats.complete)
+            {
+                const reasons = stats.missingInputs.map((input) => `${input.area ?? "unknown"}:${input.role ?? input.reason}`).join(", ");
+                results.push({ id: job.id, stats, incomplete: true, error: `incomplete high-quality conversion: ${reasons || "required input validation failed"}` });
+                hooks.onProgress?.(job, stats);
+                continue;
+            }
+            let outputPath = job.out;
+            let outputInfo;
+            try
+            {
+                outputInfo = await lstat(job.out);
+            }
+            catch (error)
+            {
+                if (error.code !== "ENOENT") throw error;
+            }
+            if (outputInfo?.isSymbolicLink())
+            {
+                try
+                {
+                    outputPath = await realpath(job.out);
+                }
+                catch (error)
+                {
+                    if (error.code !== "ENOENT") throw error;
+                    outputPath = resolve(dirname(job.out), await readlink(job.out));
+                }
+            }
+            await mkdir(dirname(outputPath), { recursive: true });
+            const temporary = join(dirname(outputPath), `.tmp-${randomUUID()}`);
+            try
+            {
+                let existingMode;
+                try
+                {
+                    existingMode = (await stat(outputPath)).mode & 0o7777;
+                }
+                catch (error)
+                {
+                    if (error.code !== "ENOENT") throw error;
+                }
+                await writeFile(temporary, glb, { mode: existingMode ?? 0o666 });
+                if (existingMode !== undefined) await chmod(temporary, existingMode);
+                await rename(temporary, outputPath);
+            }
+            catch (error)
+            {
+                await unlink(temporary).catch(() => {});
+                throw error;
+            }
             results.push({ id: job.id, out: job.out, stats });
             hooks.onProgress?.(job, stats);
         }

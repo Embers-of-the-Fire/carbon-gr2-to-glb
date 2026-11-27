@@ -44,18 +44,18 @@ node cli.js /path/to/af1_t1.gr2 \
 | `-o, --output <path>` | Output `.glb` path (default: `<input>.glb`) |
 | `--textures <dir>` | Directory holding the DDS set (default: input directory) |
 | `--stem <name>` | Texture stem override (default: input basename) |
-| `--lod <n>` | LOD mesh index, 0 = full detail (default: 0) |
+| `--lod <n>` | LOD rank, 0 selects the unsuffixed full-detail base mesh; higher ranks follow descending thresholds (default: 0) |
 | `--data-black <path>` | SOF catalog (`data.black`, gzip or raw) |
 | `--dna <hull:faction:race>` | SOF DNA, e.g. `af1_t1:amarrbase:amarr` (requires `--data-black`) |
 | `--tint <r,g,b>` | Manual albedo tint 0..1 per channel (ignored when SOF provides colors) |
-| `--boost` | Normalize faction-color brightness to the raw albedo luminance |
-| `--invert-roughness` | Treat the `_r` map as smoothness (`roughness = 1 - value`) |
 | `--flip-v` | Flip UV V coordinates |
-| `--no-flip-green` | Keep DirectX normal-map green channel |
+| `--flip-green` | Flip normal-map green for a documented per-hull exception |
+| `--no-flip-green` | Preserve source green with authored tangent frames (default) |
 | `--no-convert` | Skip left-handed → right-handed coordinate conversion |
-| `--texture-format png\|webp` | Embedded texture format (default: `png`; `webp` uses `EXT_texture_webp`) |
-| `--texture-quality <n>` | Lossy WebP quality 0..100 (default: 90) |
+| `--texture-format png\|webp\|none` | Embedded texture format, or the factor-only lightweight variant |
 | `--geometry-compression meshopt` | Geometry compression via `EXT_meshopt_compression` |
+
+For meshes stored as `[X LOD 100, X, X LOD 500]`, `--lod 0` selects `X`, `--lod 1` selects `X LOD 500`, and `--lod 2` selects `X LOD 100`.
 
 ### Input files
 
@@ -65,12 +65,12 @@ All inputs may be gzip-wrapped (as found in the client's resource cache); they a
 |---|---|
 | `<stem>.gr2` | Ship mesh (LOD0 + lower LODs as separate meshes) |
 | `<stem>_a.dds` | Albedo (BC7 RGBA, grayscale — tinted by faction colors) |
-| `<stem>_n.dds` | Normal map XY (BC5; Z reconstructed, green flipped to glTF convention) |
-| `<stem>_r.dds` | Roughness (BC4) → metallicRoughness G channel |
-| `<stem>_m.dds` | Metallic (BC4) → metallicRoughness B channel |
-| `<stem>_g.dds` | Glow (BC4) → emissive, tinted by SOF `GeneralGlowColor` |
-| `<stem>_d.dds` | Dirt — currently skipped (needs the shader's blend math) |
-| `<stem>_p3.dds` | Paint mask (BC4) — blends material 1 ↔ material 3 colors |
+| `<stem>_n.dds` | Normal map XY (BC5; source bias retained and Z reconstructed) |
+| `<stem>_r.dds` | Reflectivity (BC4) → gloss-modulated roughness |
+| `<stem>_m.dds` | Four-band material-region selector (BC4), **not metallic** |
+| `<stem>_g.dds` | Glow (BC4) → emissive, tinted by the area's SOF glow/heat color |
+| `<stem>_d.dds` | Dirt mask — drives the documented fixed dust-layer approximation |
+| `<stem>_p3.dds` | Independent paint mask (BC4), scaled by SOF `GeneralData.x` |
 | `data.black` | SOF catalog: faction materials, glow colors, texture paths |
 
 ### DNA strings
@@ -90,8 +90,13 @@ node cli.js --batch-resolve manifest.json --resolve-out resolved.json
 # (caller stages the reported files locally, then fills in gr2/textures/out)
 
 # Phase 2: convert everything offline
-node cli.js --batch manifest.json
+node cli.js --batch manifest.json --stats-out diagnostics.json
 ```
+
+`--stats-out` persists per-job LOD and area associations, source/output texture
+roles and dimensions, normal orientation, missing inputs, static approximations,
+and completeness. Incomplete high-quality jobs are errors and never replace an
+existing artifact.
 
 Pipelines that shard phase 2 across several concurrent `cli.js --batch`
 processes should set `GR2_TO_GLB_SHARP_THREADS=<n>` to cap libvips' thread
@@ -140,6 +145,21 @@ no images.
 
 Resolved jobs report full `res:/...` paths, so assets can be staged from a
 client cache or a resource index (`resfileindex.txt`) lookup.
+
+### Artifact validation
+
+Validate one artifact or every `.glb` below a generated model directory with the
+pinned application's supported feature set:
+
+```sh
+node cli.js --validate /path/to/ships --stats-out validation.json
+```
+
+Validation independently parses meshopt/quantized geometry, checks finite vertex
+data and index bounds, decodes every embedded image, verifies required material
+roles and source-area associations, and reports compressed bytes plus estimated
+decoded RGBA texture memory. Textures above the application's 2048-pixel import
+cap are explicit warnings.
 
 ### Skybox mode
 
@@ -198,16 +218,17 @@ mapping, coordinate conversion, and protobuf assembly.
 
 ## What the converter does
 
-1. **Mesh** — reads the GR2 with the runtime's format readers, takes LOD0, unpacks normals from EVE's packed tangent frames, converts left-handed (EVE/DirectX) to right-handed (glTF) coordinates, and emits one glTF primitive per mesh area.
-2. **Textures** — decodes the DDS set (BC7/BC5/BC4) on CPU and bakes standard glTF PBR maps: base color (albedo × faction material colors through the paint mask), normal (Z reconstructed), metallic-roughness (channel-repacked), emissive (glow, with `KHR_materials_emissive_strength`). All maps share EVE's single UV space, so baking is per-texel compositing — nothing is rasterized.
-3. **Materials** — data-faithful by default: every color comes from the game files or SOF catalog. Opinionated adjustments (`--boost`, `--invert-roughness`, `--tint`) are opt-in flags.
+1. **Mesh** — identifies `BaseName LOD <threshold>` siblings, deterministically selects the unique unsuffixed full-detail base, validates all buffers, repairs invalid tangent frames, converts left-handed (EVE/DirectX) to right-handed (glTF) coordinates, and carries source-area identity into every primitive.
+2. **Textures** — decodes each area's DDS set (BC7/BC5/BC4) on CPU. Four material-region weights are reconstructed from `MaterialMap`; albedo, region colors, dirt, paint, gloss, and Fresnel/F0 are composed in linear space. Output includes base color, reconstructed normals, region-derived roughness, source-F0 (`KHR_materials_specular`), and emissive maps. All full-variant WebP roles are lossless.
+3. **Materials** — every visible SOF area receives its own static conversion decision and texture bake. Hull, heat, glass, sails, detail, decal, and additive areas never silently reuse the primary hull. The separate `none` variant remains factor-only and is not presented as equivalent quality.
 
 ## Known limitations
 
 - **Environment reflections are not baked** (view-dependent by nature). Much of an EVE hull is metallic, and metal is black without an environment map — use a renderer with image-based lighting, or the model will look dim.
-- Dirt and dust-blend maps are skipped; the exact `quadv5` shader blend math is not reproduced.
-- SKIN/pattern layers are not applied.
-- Non-hull area shaders (glass, heat, sails, decals) fall back to the hull material; distortion areas are dropped.
+- Carbon's independently lit dust layer is approximated by a fixed diffuse blend; its separate view-dependent response cannot be represented by one static glTF material.
+- Heat, sail-detail, additive-effect, and secondary-detail animation is omitted in favor of documented frame-zero/static composites. True additive blending becomes emissive alpha blending.
+- Distortion and depth-only areas are omitted explicitly and reported; unsupported opaque shaders use their own factor approximation, never a hull substitute.
+- SKINR editing and runtime material/pattern customization are not applied.
 - Skinning/animation is not exported; the model is static.
 
 ## Development
