@@ -649,7 +649,26 @@ export async function bakeTextures(stem, options = {})
         }
         else if (loaded.albedo && !strictAppearance)
         {
-            slots.baseColor = await addImage(`${stem}_basecolor`, loaded.albedo, "baseColor");
+            const diffuse = materials.diffuse?.[0];
+            const baseColor = diffuse
+                ? {
+                    ...loaded.albedo,
+                    data: loaded.albedo.data.slice()
+                }
+                : loaded.albedo;
+            if (diffuse)
+            {
+                for (let pixel = 0; pixel < baseColor.data.length; pixel += 4)
+                {
+                    for (let channel = 0; channel < 3; channel++)
+                    {
+                        baseColor.data[pixel + channel] = encodeSrgb(
+                            srgbToLinear(baseColor.data[pixel + channel] / 255) * diffuse[channel]
+                        );
+                    }
+                }
+            }
+            slots.baseColor = await addImage(`${stem}_basecolor`, baseColor, "baseColor");
         }
         if (loaded.glow)
         {

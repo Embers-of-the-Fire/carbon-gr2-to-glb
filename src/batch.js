@@ -37,9 +37,9 @@
  * }
  */
 
-import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
-import { basename, dirname } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { convertShip } from "./convert.js";
 import { createSofContext, resolveSofDna, sofShipHash } from "./sof.js";
 import { makeMappedTextureResolver } from "./bake.js";
@@ -149,12 +149,31 @@ export async function runBatch(manifest, hooks = {})
                 hooks.onProgress?.(job, stats);
                 continue;
             }
-            await mkdir(dirname(job.out), { recursive: true });
-            const temporary = `${job.out}.tmp-${process.pid}-${randomUUID()}`;
+            let outputPath = job.out;
             try
             {
+                if ((await lstat(job.out)).isSymbolicLink()) outputPath = await realpath(job.out);
+            }
+            catch (error)
+            {
+                if (error.code !== "ENOENT") throw error;
+            }
+            await mkdir(dirname(outputPath), { recursive: true });
+            const temporary = join(dirname(outputPath), `.tmp-${randomUUID()}`);
+            try
+            {
+                let existingMode;
+                try
+                {
+                    existingMode = (await stat(outputPath)).mode & 0o7777;
+                }
+                catch (error)
+                {
+                    if (error.code !== "ENOENT") throw error;
+                }
                 await writeFile(temporary, glb);
-                await rename(temporary, job.out);
+                if (existingMode !== undefined) await chmod(temporary, existingMode);
+                await rename(temporary, outputPath);
             }
             catch (error)
             {

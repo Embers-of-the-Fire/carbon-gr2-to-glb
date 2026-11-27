@@ -177,7 +177,12 @@ export function buildFactorMaterials(sofShip)
         };
         const glow = decision.family === "heat" || decision.family === "heatDetail" ? area.heatGlowColor ?? area.glowColor : area.glowColor;
         Object.assign(material, emissiveFactors(decision.family === "additive" ? area.parameters?.BaseColor?.slice(0, 3) : glow) ?? {});
-        if (decision.baseColorFactor) material.baseColorFactor = decision.baseColorFactor;
+        if (decision.baseColorFactor)
+        {
+            material.baseColorFactor = decision.alphaMode === "MASK" && decision.family === "glass"
+                ? [ ...decision.baseColorFactor.slice(0, 3), 1 ]
+                : decision.baseColorFactor;
+        }
         materialByArea.set(area, materials.push(material) - 1);
     }
     return { materials, materialByArea, defaultMaterial: null };
@@ -202,7 +207,12 @@ export function buildAreaMaterial(area, slots, decision = classifyArea(area))
     };
     if (slots.specularColor !== undefined && slots.specularColor !== null) material.ior = SPECULAR_IOR;
     if (unsupported || slots.baseColor === undefined) Object.assign(material, factorForArea(area));
-    if (decision.baseColorFactor) material.baseColorFactor = decision.baseColorFactor;
+    if (decision.baseColorFactor)
+    {
+        material.baseColorFactor = decision.alphaMode === "MASK" && decision.family === "glass"
+            ? [ ...decision.baseColorFactor.slice(0, 3), 1 ]
+            : decision.baseColorFactor;
+    }
     if (decision.family === "additive") material.emissiveFactor = [ 1, 1, 1 ];
     return material;
 }
