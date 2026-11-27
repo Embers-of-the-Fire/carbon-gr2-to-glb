@@ -317,6 +317,66 @@ test("batch CLI rejects a dangling statistics symlink to an artifact before writ
     assert.equal(await readlink(statsOut), linkTarget);
 });
 
+test("batch CLI resolves a dangling statistics symlink from its canonical parent", async (t) =>
+{
+    const directory = await mkdtemp(join(tmpdir(), "carbon-gr2-batch-cli-"));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const gr2 = join(directory, "mf4_t1.gr2");
+    const out = join(directory, "actual", "ship.glb");
+    const alias = join(directory, "alias");
+    const statsOut = join(alias, "stats.json");
+    const separateStatsOut = join(alias, "diagnostics.json");
+    const linkTarget = join("..", "ship.glb");
+    const manifestPath = join(directory, "manifest.json");
+    await writeFile(gr2, syntheticGr2());
+    await mkdir(join(directory, "actual", "location"), { recursive: true });
+    await symlink(join("actual", "location"), alias);
+    await symlink(linkTarget, statsOut);
+    await writeFile(manifestPath, JSON.stringify({
+        dataBlack: "/nonexistent/data.black",
+        texture: { format: "none" },
+        jobs: [
+            {
+                id: "587",
+                dna: "mf4_t1:minmatarbase:minmatar",
+                sof: sofShip(),
+                gr2,
+                textures: {},
+                out
+            }
+        ]
+    }));
+
+    await assert.rejects(execFileAsync(process.execPath, [
+        fileURLToPath(new URL("../cli.js", import.meta.url)),
+        "--batch", manifestPath,
+        "--stats-out", statsOut
+    ]), (error) =>
+    {
+        assert.equal(error.code, 1);
+        assert.match(error.stderr, /statistics path .* conflicts with artifact/);
+        return true;
+    });
+
+    await assert.rejects(lstat(out), { code: "ENOENT" });
+    assert.equal((await lstat(statsOut)).isSymbolicLink(), true);
+    assert.equal(await readlink(statsOut), linkTarget);
+
+    const { stderr } = await execFileAsync(process.execPath, [
+        fileURLToPath(new URL("../cli.js", import.meta.url)),
+        "--batch", manifestPath,
+        "--stats-out", separateStatsOut
+    ]);
+
+    assert.match(stderr, /converted 1\/1 jobs/);
+    const output = await readFile(out);
+    const report = await validateGlb(new Uint8Array(output), { variant: "base", expectedTriangles: 1 });
+    assert.equal(report.valid, true, report.errors.join("\n"));
+    const diagnostics = JSON.parse(await readFile(separateStatsOut, "utf8"));
+    assert.equal(diagnostics.results[0].out, out);
+    assert.equal(diagnostics.results[0].error, undefined);
+});
+
 test("batch CLI accepts an artifact in output directories that do not exist yet", async (t) =>
 {
     const directory = await mkdtemp(join(tmpdir(), "carbon-gr2-batch-cli-"));

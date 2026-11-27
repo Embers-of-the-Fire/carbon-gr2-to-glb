@@ -270,8 +270,11 @@ async function canonicalPath(path)
         if (info?.isSymbolicLink())
         {
             // realpath cannot follow a link whose target does not exist yet.
-            // Resolve that target so a report cannot alias a future artifact.
-            return canonicalPath(resolve(dirname(absolute), await readlink(absolute)));
+            // Resolve relative targets from the canonical containing directory,
+            // since the path to that directory may itself traverse symlinks.
+            const linkTarget = await readlink(absolute);
+            const linkDirectory = await canonicalPath(dirname(absolute));
+            return canonicalPath(resolve(linkDirectory, linkTarget));
         }
         const parent = dirname(absolute);
         if (parent === absolute) throw error;
