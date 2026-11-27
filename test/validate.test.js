@@ -4,7 +4,14 @@ import sharp from "sharp";
 import { writeGlb } from "../src/glb.js";
 import { validateGlb } from "../src/validate.js";
 
-async function fixture({ invalidIndex = false, complete = true, variant = "full" } = {})
+async function fixture({
+    invalidIndex = false,
+    material = 0,
+    complete = true,
+    variant = "full",
+    artifactVariant = variant,
+    materialFamily = "hull"
+} = {})
 {
     const image = await sharp({
         create: { width: 1, height: 1, channels: 4, background: { r: 128, g: 128, b: 128, alpha: 1 } }
@@ -14,7 +21,7 @@ async function fixture({ invalidIndex = false, complete = true, variant = "full"
     const textured = variant === "full";
     return writeGlb({
         name: "fixture",
-        metadata: { variant, complete, sourceMesh: "fixture", sourceLod: 0 },
+        metadata: { variant: artifactVariant, complete, sourceMesh: "fixture", sourceLod: 0 },
         primitives: [ {
             name: "area_0",
             sourceAreaIndex: 0,
@@ -26,7 +33,7 @@ async function fixture({ invalidIndex = false, complete = true, variant = "full"
             tangents: new Float32Array([ 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1 ]),
             uvs: new Float32Array([ 0, 0, 1, 0, 0, 1 ]),
             indices: new Uint16Array(invalidIndex ? [ 0, 1, 3 ] : [ 0, 1, 2 ]),
-            material: 0
+            material
         } ],
         materials: [ {
             name: "hull",
@@ -36,7 +43,7 @@ async function fixture({ invalidIndex = false, complete = true, variant = "full"
             specularColor: textured ? 3 : undefined,
             emissive: textured ? 4 : undefined,
             emissiveStrength: textured ? 1 : undefined,
-            extras: { conversionFamily: "hull" }
+            ...(materialFamily === undefined ? {} : { extras: { conversionFamily: materialFamily } })
         } ],
         images: textured ? images : []
     });
@@ -59,6 +66,16 @@ test("independent validation rejects invalid indices", async () =>
     assert.ok(report.errors.some((error) => /index 3 is outside 3 vertices/.test(error)));
 });
 
+test("independent validation rejects missing or invalid primitive materials", async () =>
+{
+    for (const material of [ null, 1 ])
+    {
+        const report = await validateGlb(await fixture({ material }));
+        assert.equal(report.valid, false);
+        assert.ok(report.errors.some((error) => /primitive 0 has an invalid or missing material reference/.test(error)));
+    }
+});
+
 test("independent validation rejects incomplete conversions", async () =>
 {
     const report = await validateGlb(await fixture({ complete: false }));
@@ -71,4 +88,22 @@ test("base validation does not require full-variant textures", async () =>
     const report = await validateGlb(await fixture({ variant: "base" }), { variant: "base" });
     assert.equal(report.valid, true, report.errors.join("\n"));
     assert.equal(report.stats.images, 0);
+});
+
+test("full validation uses the primitive family when material family metadata is absent", async () =>
+{
+    const report = await validateGlb(await fixture({
+        variant: "base",
+        artifactVariant: "full",
+        materialFamily: undefined
+    }));
+    assert.equal(report.valid, false);
+    assert.ok(report.errors.some((error) => /required base color texture is missing for hull/.test(error)));
+});
+
+test("validation rejects inconsistent primitive and material families", async () =>
+{
+    const report = await validateGlb(await fixture({ materialFamily: "additive" }));
+    assert.equal(report.valid, false);
+    assert.ok(report.errors.some((error) => /does not match area family hull/.test(error)));
 });

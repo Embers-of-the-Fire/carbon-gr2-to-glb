@@ -46,7 +46,8 @@ Options:
   -o, --output <path>   Output .glb path (default: <input>.glb)
   --textures <dir>      Directory with the <stem>_*.dds set (default: input dir)
   --stem <name>         Texture stem override (default: input basename)
-  --lod <n>             LOD mesh index, 0 = full detail (default: 0)
+  --lod <n>             LOD rank, 0 = unsuffixed base; higher ranks follow
+                        descending thresholds (default: 0)
   --flip-v              Flip UV V coordinates (default: off; EVE UVs match glTF)
   --flip-green          Flip normal-map green for a documented source exception
   --no-flip-green       Preserve source green with authored tangents (default)
@@ -133,6 +134,11 @@ function parseArgs(argv)
         console.error("--batch, --batch-resolve, --batch-skybox, --batch-scene-metadata and --validate are mutually exclusive");
         process.exit(1);
     }
+    if (args.validate && ![ "full", "base" ].includes(args.validateVariant))
+    {
+        console.error("--variant must be full or base");
+        process.exit(1);
+    }
     if (batchModes.length) return args;
     if (!args.input) usage(1);
     if ((args.dataBlack && !args.dna) || (!args.dataBlack && args.dna))
@@ -169,6 +175,7 @@ async function runBatchResolveCli(path, resolveOut)
 async function runBatchCli(path, statsOut)
 {
     const manifest = JSON.parse(await readFile(path, "utf8"));
+    assertReportPathDoesNotCollide(statsOut, (manifest.jobs ?? []).map((job) => job.out).filter(Boolean));
     const { results } = await runBatch(manifest, {
         onProgress: (job, stats) =>
         {
@@ -245,17 +252,39 @@ async function collectGlbFiles(path)
     return files.sort();
 }
 
+function assertReportPathDoesNotCollide(reportPath, artifactPaths)
+{
+    if (!reportPath) return;
+    const report = resolve(reportPath);
+    const collision = artifactPaths.find((artifact) => resolve(artifact) === report);
+    if (collision) throw new Error(`statistics path ${reportPath} conflicts with artifact ${collision}`);
+}
+
 async function runValidateCli(path, statsOut, variant)
 {
     const files = await collectGlbFiles(path);
     if (!files.length) throw new Error(`no .glb files found under ${path}`);
+    assertReportPathDoesNotCollide(statsOut, files);
     const results = [];
     for (const file of files)
     {
-        const report = await validateGlb(new Uint8Array(await readFile(file)), {
-            variant,
-            maxTextureSize: 2048
-        });
+        let report;
+        try
+        {
+            report = await validateGlb(new Uint8Array(await readFile(file)), {
+                variant,
+                maxTextureSize: 2048
+            });
+        }
+        catch (error)
+        {
+            report = {
+                valid: false,
+                errors: [ `failed to read GLB: ${error.message ?? error}` ],
+                warnings: [],
+                stats: { bytes: 0 }
+            };
+        }
         results.push({ path: file, ...report });
         for (const warning of report.warnings) console.error(`warning: ${file}: ${warning}`);
         for (const error of report.errors) console.error(`error: ${file}: ${error}`);

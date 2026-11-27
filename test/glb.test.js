@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { srgbToLinear, SPECULAR_F0_BASELINE, SPECULAR_IOR } from "../src/bake.js";
 import { writeGlb } from "../src/glb.js";
 
 function parseGlb(bytes)
@@ -203,15 +204,19 @@ test("emits supported specular material data and source-area identity", () =>
             indices: new Uint16Array([ 0, 1, 2 ]),
             material: 0
         } ],
-        materials: [ { name: "hull", specularColor: 0, extras: { conversionFamily: "hull" } } ],
+        materials: [ { name: "hull", specularColor: 0, ior: SPECULAR_IOR, extras: { conversionFamily: "hull" } } ],
         images: [ { name: "f0", data: new Uint8Array([ 0x89, 0x50, 0x4e, 0x47 ]), mimeType: "image/png" } ]
     });
     const { json } = parseGlb(glb);
     const material = json.materials[0];
-    assert.deepEqual(json.extensionsUsed, [ "KHR_materials_specular" ]);
+    assert.deepEqual(json.extensionsUsed, [ "KHR_materials_specular", "KHR_materials_ior" ]);
     assert.equal(json.extensionsRequired, undefined);
     assert.equal(material.extensions.KHR_materials_specular.specularColorTexture.index, 0);
     assert.deepEqual(material.extensions.KHR_materials_specular.specularColorFactor, [ 1, 1, 1 ]);
+    assert.equal(material.extensions.KHR_materials_ior.ior, SPECULAR_IOR);
+    const encodedTextureChannel = 124;
+    const effectiveF0 = SPECULAR_F0_BASELINE * srgbToLinear(encodedTextureChannel / 255);
+    assert.ok(Math.abs(effectiveF0 - 0.1) < 0.002);
     assert.equal(material.extras.conversionFamily, "hull");
     assert.deepEqual(json.meshes[0].primitives[0].extras, {
         sourceAreaIndex: 7,

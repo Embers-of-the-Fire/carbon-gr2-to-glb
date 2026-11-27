@@ -11,9 +11,11 @@ const SUPPORTED_USED = new Set([
     "EXT_meshopt_compression",
     "KHR_mesh_quantization",
     "KHR_materials_emissive_strength",
-    "KHR_materials_specular"
+    "KHR_materials_specular",
+    "KHR_materials_ior"
 ]);
 const QUAD_FAMILIES = new Set([ "hull", "heat", "glass", "sails", "detail", "heatDetail" ]);
+const FACTOR_ONLY_FAMILIES = new Set([ "unsupported" ]);
 let decoderReady = null;
 
 function parseDocument(bytes)
@@ -154,6 +156,49 @@ export async function validateGlb(bytes, options = {})
     for (const [primitiveIndex, primitive] of (json.meshes?.[0]?.primitives ?? []).entries())
     {
         const extras = primitive.extras ?? {};
+        const material = json.materials?.[primitive.material];
+        if (!Number.isInteger(primitive.material) || primitive.material < 0 || !material)
+        {
+            errors.push(`primitive ${primitiveIndex} has an invalid or missing material reference`);
+        }
+        else
+        {
+            const family = extras.conversionFamily;
+            const materialFamily = material.extras?.conversionFamily;
+            if (materialFamily !== undefined && materialFamily !== family)
+            {
+                errors.push(`primitive ${primitiveIndex}: material conversion family ${materialFamily} does not match area family ${family}`);
+            }
+            const pbr = material.pbrMetallicRoughness ?? {};
+            const requiredTextures = json.asset?.extras?.variant === "base"
+                ? []
+                : family === "additive"
+                    ? [ ["base color", pbr.baseColorTexture], ["emissive", material.emissiveTexture] ]
+                    : QUAD_FAMILIES.has(family)
+                        ? [
+                            ["base color", pbr.baseColorTexture],
+                            ["metallic/roughness", pbr.metallicRoughnessTexture],
+                            ["normal", material.normalTexture],
+                            ["emissive", material.emissiveTexture],
+                            ["specular color", material.extensions?.KHR_materials_specular?.specularColorTexture]
+                        ]
+                        : FACTOR_ONLY_FAMILIES.has(family)
+                            ? []
+                            : null;
+            if (requiredTextures === null)
+            {
+                errors.push(`primitive ${primitiveIndex}: unsupported or missing conversion family ${family}`);
+            }
+            else
+            {
+                for (const [role, texture] of requiredTextures)
+                {
+                    const name = material.name ?? `material ${primitive.material}`;
+                    if (!texture) errors.push(`${name}: required ${role} texture is missing for ${family}`);
+                    else textureIndexError(errors, name, role, texture, json.textures?.length ?? 0);
+                }
+            }
+        }
         if (!Number.isInteger(extras.sourceAreaIndex) || !extras.sourceAreaName || !extras.sofAreaName || !extras.conversionFamily)
         {
             errors.push(`primitive ${primitiveIndex} lacks source-area/material association metadata`);
@@ -198,26 +243,6 @@ export async function validateGlb(bytes, options = {})
     for (const [materialIndex, material] of (json.materials ?? []).entries())
     {
         const name = material.name ?? `material ${materialIndex}`;
-        const family = material.extras?.conversionFamily;
-        const pbr = material.pbrMetallicRoughness ?? {};
-        const requiredTextures = json.asset?.extras?.variant === "base"
-            ? []
-            : family === "additive"
-                ? [ ["base color", pbr.baseColorTexture], ["emissive", material.emissiveTexture] ]
-                : QUAD_FAMILIES.has(family)
-                ? [
-                    ["base color", pbr.baseColorTexture],
-                    ["metallic/roughness", pbr.metallicRoughnessTexture],
-                    ["normal", material.normalTexture],
-                    ["emissive", material.emissiveTexture],
-                    ["specular color", material.extensions?.KHR_materials_specular?.specularColorTexture]
-                ]
-                : [];
-        for (const [role, texture] of requiredTextures)
-        {
-            if (!texture) errors.push(`${name}: required ${role} texture is missing for ${family}`);
-            else textureIndexError(errors, name, role, texture, textures.length);
-        }
         if (material.alphaMode && ![ "OPAQUE", "MASK", "BLEND" ].includes(material.alphaMode))
         {
             errors.push(`${name}: unsupported alphaMode ${material.alphaMode}`);

@@ -38,6 +38,7 @@
  */
 
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { basename, dirname } from "node:path";
 import { convertShip } from "./convert.js";
 import { createSofContext, resolveSofDna, sofShipHash } from "./sof.js";
@@ -149,7 +150,7 @@ export async function runBatch(manifest, hooks = {})
                 continue;
             }
             await mkdir(dirname(job.out), { recursive: true });
-            const temporary = `${job.out}.tmp-${process.pid}`;
+            const temporary = `${job.out}.tmp-${process.pid}-${randomUUID()}`;
             try
             {
                 await writeFile(temporary, glb);

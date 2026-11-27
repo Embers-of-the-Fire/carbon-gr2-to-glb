@@ -98,6 +98,11 @@ export function writeGlb(model)
                 specularColorTexture: { index: mat.specularColor }
             };
         }
+        if (typeof mat.ior === "number" && mat.ior !== 1.5)
+        {
+            out.extensions ??= {};
+            out.extensions.KHR_materials_ior = { ior: mat.ior };
+        }
         if (mat.extras) out.extras = mat.extras;
         return out;
     });
@@ -200,6 +205,10 @@ export function writeGlb(model)
     if (gltfMaterials.some((mat) => mat.extensions?.KHR_materials_specular))
     {
         extensionsUsed.push("KHR_materials_specular");
+    }
+    if (gltfMaterials.some((mat) => mat.extensions?.KHR_materials_ior))
+    {
+        extensionsUsed.push("KHR_materials_ior");
     }
     if (extensionsUsed.length)
     {

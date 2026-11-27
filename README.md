@@ -44,7 +44,7 @@ node cli.js /path/to/af1_t1.gr2 \
 | `-o, --output <path>` | Output `.glb` path (default: `<input>.glb`) |
 | `--textures <dir>` | Directory holding the DDS set (default: input directory) |
 | `--stem <name>` | Texture stem override (default: input basename) |
-| `--lod <n>` | LOD mesh index, 0 = full detail (default: 0) |
+| `--lod <n>` | LOD rank, 0 selects the unsuffixed full-detail base mesh; higher ranks follow descending thresholds (default: 0) |
 | `--data-black <path>` | SOF catalog (`data.black`, gzip or raw) |
 | `--dna <hull:faction:race>` | SOF DNA, e.g. `af1_t1:amarrbase:amarr` (requires `--data-black`) |
 | `--tint <r,g,b>` | Manual albedo tint 0..1 per channel (ignored when SOF provides colors) |
@@ -54,6 +54,8 @@ node cli.js /path/to/af1_t1.gr2 \
 | `--no-convert` | Skip left-handed → right-handed coordinate conversion |
 | `--texture-format png\|webp\|none` | Embedded texture format, or the factor-only lightweight variant |
 | `--geometry-compression meshopt` | Geometry compression via `EXT_meshopt_compression` |
+
+For meshes stored as `[X LOD 100, X, X LOD 500]`, `--lod 0` selects `X`, `--lod 1` selects `X LOD 500`, and `--lod 2` selects `X LOD 100`.
 
 ### Input files
 

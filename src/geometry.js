@@ -209,7 +209,7 @@ function channelVertexCount(values, components, label, meshName, required)
 /**
  * Validate one index group and coerce it to a fresh typed array, widening to
  * Uint32Array when the source declares 4-byte indices or references vertices
- * past the 16-bit range.
+ * at or above glTF's reserved 16-bit index value (65535).
  */
 function coerceIndices(faces, bytesPerIndex, vertexCount, meshName, groupName)
 {
@@ -246,7 +246,7 @@ function coerceIndices(faces, bytesPerIndex, vertexCount, meshName, groupName)
         }
         if (value > max) max = value;
     }
-    const wide = bytesPerIndex === 4 || max > 0xffff || faces instanceof Uint32Array;
+    const wide = bytesPerIndex === 4 || max >= 0xffff || faces instanceof Uint32Array;
     const out = wide ? new Uint32Array(faces.length) : new Uint16Array(faces.length);
     out.set(faces);
     return out;
@@ -448,7 +448,21 @@ export function extractGeometry(shared, options = {})
         repairedNormals++;
     }
 
-    // --- Tangents: keep valid decoded frames; repair null/invalid/missing.
+    // Normalize kept source normals before projecting or generating tangents.
+    if (normalCount !== null)
+    {
+        for (let i = 0; i < vertexCount; i++)
+        {
+            if (!normalValid[i]) continue;
+            const offset = i * 3;
+            const length = Math.hypot(normals[offset], normals[offset + 1], normals[offset + 2]) || 1;
+            normals[offset] /= length;
+            normals[offset + 1] /= length;
+            normals[offset + 2] /= length;
+        }
+    }
+
+    // --- Tangents: project decoded frames against selected normals; repair collapsed/invalid/missing.
     let nullTangentFrames = 0;
     let invalidTangentFrames = 0;
     let repairedTangents = 0;
@@ -472,15 +486,28 @@ export function extractGeometry(shared, options = {})
             }
             else if (validDecodedFrame(frame))
             {
-                const length = Math.hypot(frame.T[0], frame.T[1], frame.T[2]) || 1;
-                tangents[tOffset] = frame.T[0] / length;
-                tangents[tOffset + 1] = frame.T[1] / length;
-                tangents[tOffset + 2] = frame.T[2] / length;
-                const cx = frame.N[1] * frame.T[2] - frame.N[2] * frame.T[1];
-                const cy = frame.N[2] * frame.T[0] - frame.N[0] * frame.T[2];
-                const cz = frame.N[0] * frame.T[1] - frame.N[1] * frame.T[0];
-                tangents[tOffset + 3] = cx * frame.B[0] + cy * frame.B[1] + cz * frame.B[2] >= 0 ? 1 : -1;
-                valid = true;
+                const nx = normals[offset], ny = normals[offset + 1], nz = normals[offset + 2];
+                const dot = nx * frame.T[0] + ny * frame.T[1] + nz * frame.T[2];
+                const tx = frame.T[0] - nx * dot;
+                const ty = frame.T[1] - ny * dot;
+                const tz = frame.T[2] - nz * dot;
+                if (tx * tx + ty * ty + tz * tz > VECTOR_EPSILON_SQUARED)
+                {
+                    const length = Math.hypot(tx, ty, tz);
+                    tangents[tOffset] = tx / length;
+                    tangents[tOffset + 1] = ty / length;
+                    tangents[tOffset + 2] = tz / length;
+                    const cx = ny * tz - nz * ty;
+                    const cy = nz * tx - nx * tz;
+                    const cz = nx * ty - ny * tx;
+                    tangents[tOffset + 3] = cx * frame.B[0] + cy * frame.B[1] + cz * frame.B[2] >= 0 ? 1 : -1;
+                    if (flipV) tangents[tOffset + 3] = -tangents[tOffset + 3];
+                    valid = true;
+                }
+                else
+                {
+                    invalidTangentFrames++;
+                }
             }
             else
             {
@@ -514,20 +541,6 @@ export function extractGeometry(shared, options = {})
                 degenerateTangentFallbacks++;
             }
             repairedTangents++;
-        }
-    }
-
-    // Normalize kept source normals (validated finite and non-zero above).
-    if (normalCount !== null)
-    {
-        for (let i = 0; i < vertexCount; i++)
-        {
-            if (!normalValid[i]) continue;
-            const offset = i * 3;
-            const length = Math.hypot(normals[offset], normals[offset + 1], normals[offset + 2]) || 1;
-            normals[offset] /= length;
-            normals[offset + 1] /= length;
-            normals[offset + 2] /= length;
         }
     }
 

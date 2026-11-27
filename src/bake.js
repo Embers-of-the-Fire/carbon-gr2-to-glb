@@ -24,6 +24,9 @@ const REGION_SCALE = 3.1914894580841064;
 const REGION_OFFSET = 1.0319149494171143;
 const PAINT_F0 = [ 0.038384001702070236, 0.03935199975967407, 0.03916500136256218 ];
 const DEFAULT_F0 = [ 0.04, 0.04, 0.04 ];
+// This baseline supports authored F0 values through 0.5 without texture clipping.
+export const SPECULAR_IOR = (1 + Math.SQRT1_2) / (1 - Math.SQRT1_2);
+export const SPECULAR_F0_BASELINE = ((SPECULAR_IOR - 1) / (SPECULAR_IOR + 1)) ** 2;
 const DEFAULT_DUST = [ 0.045, 0.043, 0.045 ];
 const DUST_APPROXIMATION = 0.14;
 
@@ -210,8 +213,7 @@ export function buildNormalMap(image, flipGreen = false, diagnostics = {}, detai
                 : 1;
             const amount = clamp01(texel[3] / 255 * layer.weight * regionWeight);
             const detailX = (texel[0] / 255 + 0.002) * 2 - 1;
-            let detailY = (texel[1] / 255 + 0.002) * 2 - 1;
-            if (flipGreen) detailY = -detailY;
+            const detailY = (texel[1] / 255 + 0.002) * 2 - 1;
             x = mix(x, detailX, amount);
             y = mix(y, detailY, amount);
         }
@@ -339,7 +341,7 @@ export function bakeQuadAppearance({ albedo, material, paintMask, roughness, dir
         {
             const albedoLinear = srgbToLinear(albedo.data[offset + channel] / 255);
             baseColor[offset + channel] = encodeSrgb(albedoLinear * surfaceDiffuse[channel] * detailMultiplier);
-            specularColor[offset + channel] = encodeSrgb(f0[channel]);
+            specularColor[offset + channel] = encodeSrgb(f0[channel] / SPECULAR_F0_BASELINE);
         }
         baseColor[offset + 3] = albedo.data[offset + 3];
         metallicRoughness[offset] = 255;
@@ -518,7 +520,7 @@ export async function bakeTextures(stem, options = {})
     };
     const load = async (logical, required) =>
     {
-        const fallback = FALLBACKS[logical] ? `${stem}_${FALLBACKS[logical]}.dds` : null;
+        const fallback = FALLBACKS[logical] ? `${options.fallbackStem ?? stem}_${FALLBACKS[logical]}.dds` : null;
         const label = names[logical] ?? fallback;
         if (!label)
         {
@@ -542,8 +544,11 @@ export async function bakeTextures(stem, options = {})
     const strictAppearance = options.requireCompleteMaterials === true;
     const required = additive
         ? [ "layer1", "layerMask" ]
-        : [ ...QUAD_REQUIRED, ...(strictAppearance ? [ "dustNoise" ] : []), ...((family === "heat" || family === "heatDetail") && strictAppearance ? [ "heatGlowNoise" ] : []), ...(family === "sails" ? [ "sailsDetail" ] : []), ...(family === "detail" || family === "heatDetail" ? [ "detail1", "detail2" ] : []) ];
-    const logicalNames = new Set([ ...required, "layer2", "detail3" ]);
+        : [ ...(strictAppearance ? QUAD_REQUIRED : [ "albedo" ]), ...(strictAppearance ? [ "dustNoise" ] : []), ...((family === "heat" || family === "heatDetail") && strictAppearance ? [ "heatGlowNoise" ] : []), ...(family === "sails" ? [ "sailsDetail" ] : []), ...(family === "detail" || family === "heatDetail" ? [ "detail1", "detail2" ] : []) ];
+    const optional = additive
+        ? []
+        : [ "dustNoise", ...((family === "heat" || family === "heatDetail") ? [ "heatGlowNoise" ] : []) ];
+    const logicalNames = new Set([ ...QUAD_REQUIRED, ...required, ...optional, "detail3" ]);
     const loaded = {};
     await Promise.all([ ...logicalNames ].map(async (logical) =>
     {
@@ -642,6 +647,10 @@ export async function bakeTextures(stem, options = {})
             slots.metallicRoughness = await addImage(`${stem}_roughness`, baked.metallicRoughness, "metallicRoughness");
             slots.specularColor = await addImage(`${stem}_specular`, baked.specularColor, "specularColor");
         }
+        else if (loaded.albedo && !strictAppearance)
+        {
+            slots.baseColor = await addImage(`${stem}_basecolor`, loaded.albedo, "baseColor");
+        }
         if (loaded.glow)
         {
             const glowColor = family === "heat" || family === "heatDetail"
@@ -660,7 +669,7 @@ export async function bakeTextures(stem, options = {})
 
     for (const logical of [ "layer2" ])
     {
-        if (loaded[logical]) diagnostics.skipped.push({ role: logical, path: names[logical], reason: "dynamic layer or secondary detail is covered by the documented static approximation" });
+        if (names[logical]) diagnostics.skipped.push({ role: logical, path: names[logical], reason: "dynamic layer or secondary detail is covered by the documented static approximation" });
     }
 
     return {

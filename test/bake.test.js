@@ -1,9 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import sharp from "sharp";
+import { PixelFormat, TextureType } from "@carbonenginejs/runtime/consts/render-context";
+import { CjsDdsFormat } from "@carbonenginejs/runtime/resource/formats/dds";
 import {
     applySharpConcurrencyFromEnv,
     bakeQuadAppearance,
+    bakeTextures,
     blendAlbedoWithMaterials,
     buildMetallicRoughnessMap,
     buildNormalMap,
@@ -11,6 +14,7 @@ import {
     materialRegionWeights,
     resampleImage,
     srgbToLinear,
+    SPECULAR_F0_BASELINE,
     WEBP_ENCODING_POLICY
 } from "../src/bake.js";
 
@@ -88,7 +92,8 @@ test("paint removes the region tint without changing albedo's color-space conver
     const baked = bakeQuadAppearance(appearanceMaps({ selector: 0, paint: 255 }), materials());
     assert.deepEqual(pixel(baked.baseColor, 0, 0), [128, 128, 128, 255]);
     assert.equal(pixel(baked.metallicRoughness, 0, 0)[1], Math.round(0.6 * 255));
-    assert.ok(pixel(baked.specularColor, 0, 0)[0] > 50 && pixel(baked.specularColor, 0, 0)[0] < 60, "paint uses the fixed dielectric F0");
+    const effectiveF0 = pixel(baked.specularColor, 0, 0).slice(0, 3).map((value) => srgbToLinear(value / 255) * SPECULAR_F0_BASELINE);
+    assert.ok(Math.abs(effectiveF0[0] - 0.038384) < 0.001, "paint uses the fixed dielectric F0");
 });
 
 test("roughness uses region gloss and reflectivity while specular preserves authored F0", () =>
@@ -96,7 +101,11 @@ test("roughness uses region gloss and reflectivity while specular preserves auth
     const baked = bakeQuadAppearance(appearanceMaps({ selector: 0, paint: 0, reflectivity: 128 }), materials());
     const expectedRoughness = Math.round((1 - 128 / 255 * 0.5) * 255);
     assert.equal(pixel(baked.metallicRoughness, 0, 0)[1], expectedRoughness);
-    assert.deepEqual(pixel(baked.specularColor, 0, 0).slice(0, 3), [89, 124, 149]);
+    const effectiveF0 = pixel(baked.specularColor, 0, 0).slice(0, 3).map((value) => srgbToLinear(value / 255) * SPECULAR_F0_BASELINE);
+    for (const [channel, expected] of effectiveF0.map((value, index) => [ value, [ 0.1, 0.2, 0.3 ][index] ]))
+    {
+        assert.ok(Math.abs(channel - expected) < 0.002);
+    }
 });
 
 test("linear and sRGB conversions use the standard transfer function", () =>
@@ -138,6 +147,20 @@ test("detail normals combine map strength, alpha, and per-region selectors", () 
     const deselected = buildNormalMap(source, false, {}, [{ ...layer, regionStrengths: [1, 0, 0, 0] }]);
     assert.equal(selected.data[0], 255);
     assert.equal(deselected.data[0], 129);
+});
+
+test("detail normals apply the green flip once after blending", () =>
+{
+    const source = rgba(1, 1, () => [128, 128, 0]);
+    const detail = rgba(1, 1, () => [128, 200, 0, 255]);
+    const layer = { image: detail, tiling: 1, weight: 1 };
+    const normal = buildNormalMap(source, false, {}, [layer]);
+    const flipped = buildNormalMap(source, true, {}, [layer]);
+    assert.equal(normal.data[0], flipped.data[0]);
+    assert.equal(normal.data[1] + flipped.data[1], 255);
+
+    const baseOnly = buildNormalMap(source, true, {});
+    assert.equal(baseOnly.data[1] + buildNormalMap(source, false, {}).data[1], 255);
 });
 
 test("resampleImage returns the input untouched when sizes match", () =>
@@ -183,6 +206,80 @@ test("full-variant WebP encoding is lossless for every emitted texture role", ()
     {
         assert.equal(WEBP_ENCODING_POLICY[slot].lossless, true, `missing lossless policy for ${slot}`);
     }
+});
+
+test("non-strict heat bakes load supplied optional heat and dust noise", async () =>
+{
+    const roles = [ "albedo", "normal", "roughness", "material", "glow", "dirt", "paintMask", "dustNoise", "heatGlowNoise" ];
+    const textureNames = Object.fromEntries(roles.map((role) => [ role, `res:/${role}.png` ]));
+    const requested = new Set();
+    const baked = await bakeTextures("test", {
+        family: "heat",
+        textureNames,
+        resolveTexture: async (logical) =>
+        {
+            requested.add(logical);
+            return null;
+        }
+    });
+    for (const role of [ "dustNoise", "heatGlowNoise" ])
+    {
+        assert.ok(requested.has(role));
+        assert.ok(!baked.diagnostics.missing.some((texture) => texture.role === role));
+    }
+});
+
+test("layer2 maps are recorded as skipped without reading them", async () =>
+{
+    const path = "res:/dx9/texture/layer2.dds";
+    const requested = new Set();
+    const baked = await bakeTextures("test", {
+        textureNames: { layer2: path },
+        resolveTexture: async (logical) =>
+        {
+            requested.add(logical);
+            return null;
+        }
+    });
+    assert.ok(!requested.has("layer2"));
+    assert.deepEqual(baked.diagnostics.skipped, [ {
+        role: "layer2",
+        path,
+        reason: "dynamic layer or secondary detail is covered by the documented static approximation"
+    } ]);
+});
+
+test("non-strict bake returns an albedo-only base color texture", async () =>
+{
+    const bytes = CjsDdsFormat.write({
+        description: {
+            type: TextureType.TEX_TYPE_2D,
+            format: PixelFormat.PIXEL_FORMAT_BC1_UNORM,
+            width: 4,
+            height: 4,
+            depth: 1,
+            mipCount: 1,
+            arraySize: 1
+        },
+        data: new Uint8Array(8)
+    });
+    const baked = await bakeTextures("ship", {
+        fallbackStem: "fallback",
+        textureNames: { albedo: "ship_a.dds" },
+        resolveTexture: async (logical, resPath, label) =>
+        {
+            if (logical !== "albedo") return null;
+            assert.equal(resPath, "ship_a.dds");
+            assert.equal(label, "ship_a.dds");
+            return bytes;
+        }
+    });
+    assert.ok(baked.slots.baseColor !== undefined);
+    assert.equal(baked.slots.normal, undefined);
+    assert.equal(baked.slots.metallicRoughness, undefined);
+    assert.equal(baked.slots.specularColor, undefined);
+    assert.equal(baked.images.length, 1);
+    assert.deepEqual(baked.diagnostics.missing, []);
 });
 
 test("applySharpConcurrencyFromEnv caps libvips threads from the env var", () =>

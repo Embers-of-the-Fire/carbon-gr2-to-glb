@@ -5,7 +5,7 @@ import { createHash } from "node:crypto";
 import { CjsGr2Format } from "@carbonenginejs/runtime/resource/formats/gr2";
 import { CjsCmfFormat } from "@carbonenginejs/runtime/resource/formats/cmf";
 import { extractGeometry } from "./geometry.js";
-import { bakeTextures, decompressIfGzip } from "./bake.js";
+import { bakeTextures, decompressIfGzip, SPECULAR_IOR } from "./bake.js";
 import { loadSofShip } from "./sof.js";
 import { writeGlb } from "./glb.js";
 import { compressGlbGeometry } from "./compress.js";
@@ -70,7 +70,7 @@ export function pickHullArea(sofShip)
  * Explicit static conversion decision for every source shader family. Unsupported
  * opaque families get their own factor approximation, never the primary hull.
  */
-export function classifyArea(area)
+function classifyBakeFamily(area)
 {
     const shader = area.shader ?? "";
     if (area.group === "depthAreas") return { family: "depth", visible: false, reason: "depth-only areas are not visible color surfaces" };
@@ -103,9 +103,9 @@ export function classifyArea(area)
     }
     if (isSailsShader(shader)) return { family: "sails", visible: true, doubleSided: true, reason: "per-area sails bake with static detail composite" };
     if (/quaddetail/i.test(shader)) return { family: "detail", visible: true, reason: "per-area quad/detail static bake" };
-    if (area.group === "decalAreas" || area.alphaCutout)
+    if (area.group === "decalAreas")
     {
-        return { family: "hull", visible: true, alphaMode: "MASK", alphaCutoff: area.alphaCutoff ?? 0.5, reason: "per-area decal bake with alpha cutout" };
+        return { family: "hull", visible: true, reason: "per-area decal bake" };
     }
     if (/quadv5/i.test(shader) || area.group === "opaqueAreas")
     {
@@ -119,6 +119,21 @@ export function classifyArea(area)
     return { family: "unsupported", visible: true, reason: `unsupported ${area.group} shader ${shader || "unknown"} uses its own fixed factor approximation` };
 }
 
+export function classifyArea(area)
+{
+    const decision = classifyBakeFamily(area);
+    if (decision.visible && (area.alphaCutout || area.group === "decalAreas"))
+    {
+        return {
+            ...decision,
+            alphaMode: "MASK",
+            alphaCutoff: area.alphaCutoff ?? 0.5,
+            reason: `${decision.reason} with alpha cutout`
+        };
+    }
+    return decision;
+}
+
 function emissiveFactors(glowColor)
 {
     if (!glowColor) return null;
@@ -130,8 +145,9 @@ function factorForArea(area, lightweight = false)
 {
     const diffuse = lightweight ? normalizeMaterialBrightness(area?.materials?.diffuse ?? null) : area?.materials?.diffuse;
     const base = diffuse?.find(Boolean) ?? [ 0.7, 0.7, 0.7 ];
+    const baseColor = lightweight ? base.map((value) => Math.min(1, Math.max(0, value * 0.7))) : base;
     return {
-        baseColorFactor: [ base[0] * (lightweight ? 0.7 : 1), base[1] * (lightweight ? 0.7 : 1), base[2] * (lightweight ? 0.7 : 1), 1 ],
+        baseColorFactor: [ baseColor[0], baseColor[1], baseColor[2], 1 ],
         roughnessFactor: 1 - (area?.materials?.gloss?.find((value) => value !== null && value !== undefined) ?? 0.4),
         metallicFactor: lightweight ? 0.35 : 0
     };
@@ -184,6 +200,7 @@ export function buildAreaMaterial(area, slots, decision = classifyArea(area))
         doubleSided: decision.doubleSided === true,
         extras: { conversionFamily: decision.family, conversionDecision: decision.reason }
     };
+    if (slots.specularColor !== undefined && slots.specularColor !== null) material.ior = SPECULAR_IOR;
     if (unsupported || slots.baseColor === undefined) Object.assign(material, factorForArea(area));
     if (decision.baseColorFactor) material.baseColorFactor = decision.baseColorFactor;
     if (decision.family === "additive") material.emissiveFactor = [ 1, 1, 1 ];
@@ -345,6 +362,13 @@ export async function convertShip(gr2Bytes, options)
                 complete: true
             };
             areaDiagnostics.push(diagnostic);
+            if (primitive.indices.length === 0)
+            {
+                diagnostic.visible = false;
+                diagnostic.decision = "not drawn";
+                diagnostic.reason = "source mesh group contains no triangles";
+                continue;
+            }
             if (!factorOnly && !reportedAreaInputs.has(area))
             {
                 reportedAreaInputs.add(area);
@@ -388,6 +412,7 @@ export async function convertShip(gr2Bytes, options)
                     {
                         const stem = `${options.stem}_${String(area.ordinal ?? area.index ?? "x")}_${String(area.name ?? "area").replace(/[^a-z0-9_-]+/gi, "_")}`;
                         const result = await bakeTextures(stem, {
+                            fallbackStem: sofShip ? undefined : options.stem,
                             textureDir: options.textureDir,
                             resolveTexture: options.resolveTexture,
                             flipGreen: flipGreenForArea(area, options),
@@ -403,7 +428,7 @@ export async function convertShip(gr2Bytes, options)
                             requireCompleteMaterials: sofShip !== null && decision.family !== "additive" && decision.family !== "unsupported"
                         });
                         const slots = { ...result.slots };
-                        for (const image of result.images)
+                        const localToGlobal = result.images.map((image) =>
                         {
                             const hash = hashImage(image);
                             let imageIndex = imageHashes.get(hash);
@@ -412,11 +437,12 @@ export async function convertShip(gr2Bytes, options)
                                 imageIndex = images.push(image) - 1;
                                 imageHashes.set(hash, imageIndex);
                             }
-                            const localIndex = result.images.indexOf(image);
-                            for (const slot of TEXTURE_SLOT_KEYS)
-                            {
-                                if (slots[slot] === localIndex) slots[slot] = imageIndex;
-                            }
+                            return imageIndex;
+                        });
+                        for (const slot of TEXTURE_SLOT_KEYS)
+                        {
+                            const localIndex = result.slots[slot];
+                            if (localIndex !== undefined && localIndex !== null) slots[slot] = localToGlobal[localIndex];
                         }
                         for (const missing of result.diagnostics.missing)
                         {
@@ -452,6 +478,10 @@ export async function convertShip(gr2Bytes, options)
         }
     }
 
+    if (renderPrimitives.length === 0)
+    {
+        throw new Error(`No drawable triangles remain in source mesh "${extracted.name}"`);
+    }
     const complete = missingInputs.length === 0 && areaDiagnostics.every((area) => area.complete !== false);
     const glbMaterials = materials.length ? materials : [ { name: "unassigned", baseColorFactor: [ 0.7, 0.7, 0.7, 1 ] } ];
     let glb = writeGlb({

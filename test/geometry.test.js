@@ -263,7 +263,7 @@ test("coordinate conversion negates Z, reverses winding, and flips tangent hande
     const n = normalAt(prim, 0);
     assert.ok(near(n[1], invSqrt2) && near(n[2], -invSqrt2), `converted normal ${n}`);
     const t = tangentAt(prim, 0);
-    assert.ok(near(t[2], -1, 1e-3), `tangent Z must be negated, got ${t}`);
+    assert.ok(near(t[1], -invSqrt2) && near(t[2], -invSqrt2), `projected tangent Z must be negated, got ${t}`);
     assert.equal(t[3], -1, "tangent handedness must flip with the coordinate conversion");
 
     const untouched = extractGeometry(shared, { convertCoordinates: false });
@@ -271,12 +271,13 @@ test("coordinate conversion negates Z, reverses winding, and flips tangent hande
     assert.deepEqual([...uprim.indices], [ 0, 1, 2 ]);
     assert.ok(near(normalAt(uprim, 0)[2], invSqrt2));
     assert.equal(tangentAt(uprim, 0)[3], 1, "without conversion the authored w=+1 frame is preserved");
-    assert.ok(near(tangentAt(uprim, 0)[2], 1, 1e-3), "without conversion the authored tangent is preserved");
+    const ut = tangentAt(uprim, 0);
+    assert.ok(near(ut[1], -invSqrt2) && near(ut[2], invSqrt2), "without conversion the projected tangent is preserved");
 });
 
 test("flipV flips V and the handedness of generated tangents", () =>
 {
-    const shared = squareShared(); // packed channel present: authored w preserved
+    const shared = squareShared();
     const flipped = extractGeometry(shared, { flipV: true });
     assert.deepEqual([...flipped.primitives[0].uvs.filter((_, i) => i % 2 === 1)], [ 1, 1, 0, 0 ]);
 
@@ -295,6 +296,30 @@ test("flipV flips V and the handedness of generated tangents", () =>
 });
 
 // --- Tangent frame repair --------------------------------------------------------
+
+test("flipV keeps authored and repaired tangent handedness consistent", () =>
+{
+    const shared = squareShared({
+        packedTangents: [ ...FRAME_XY, ...FRAME_XY, ...NULL_FRAME, ...FRAME_XY ]
+    });
+    for (const convertCoordinates of [ false, true ])
+    {
+        for (const flipV of [ false, true ])
+        {
+            const { primitives, diagnostics } = extractGeometry(shared, { convertCoordinates, flipV });
+            const expectedSign = flipV === convertCoordinates ? 1 : -1;
+            assert.equal(diagnostics.tangents.nullFrames, 1);
+            assert.equal(diagnostics.tangents.repaired, 1);
+            assert.equal(diagnostics.tangents.degenerateFallbacks, 0);
+            for (let i = 0; i < 4; i++)
+            {
+                const tangent = tangentAt(primitives[0], i);
+                assert.equal(tangent[3], expectedSign, `vertex ${i}, flipV=${flipV}, convertCoordinates=${convertCoordinates}`);
+                assert.ok(near(tangent[0], 1) && near(tangent[1], 0) && near(tangent[2], 0));
+            }
+        }
+    }
+});
 
 test("null sentinel frames are repaired and counted, valid neighbours are preserved", () =>
 {
@@ -334,6 +359,53 @@ test("degenerate non-sentinel packed frames are counted invalid and repaired", (
     assert.equal(diagnostics.tangents.nullFrames, 0);
     assert.equal(diagnostics.tangents.repaired, 1);
     assert.ok(tangentAt(primitives[0], 0).every(Number.isFinite));
+});
+
+test("decoded tangents are projected against selected source normals and collapsed projections are repaired", () =>
+{
+    const shared = squareShared({
+        normals: [ 2, 0, 0, 2, 0, 2, 0, 0, 2, 0, 0, -2 ]
+    });
+    for (const convertCoordinates of [ false, true ])
+    {
+        const { primitives, diagnostics } = extractGeometry(shared, { convertCoordinates });
+        const prim = primitives[0];
+        assert.equal(diagnostics.normals.repaired, 0);
+        assert.equal(diagnostics.tangents.invalidFrames, 1);
+        assert.equal(diagnostics.tangents.repaired, 1);
+        assert.equal(diagnostics.tangents.degenerateFallbacks, 1);
+        for (let i = 0; i < 4; i++)
+        {
+            const n = normalAt(prim, i);
+            const t = tangentAt(prim, i);
+            assert.ok(t.every(Number.isFinite));
+            assertUnit(n, `normal ${i}`);
+            assertUnit(t.slice(0, 3), `tangent ${i}`);
+            assert.ok(near(n[0] * t[0] + n[1] * t[1] + n[2] * t[2], 0, 1e-6));
+            assert.ok(t[3] === 1 || t[3] === -1);
+        }
+        const projected = tangentAt(prim, 1);
+        assert.ok(near(projected[0], 1 / Math.SQRT2));
+        assert.ok(near(projected[2], (convertCoordinates ? 1 : -1) / Math.SQRT2));
+        assert.deepEqual(tangentAt(prim, 2), [ 1, 0, convertCoordinates ? -0 : 0, convertCoordinates ? -1 : 1 ]);
+        assert.equal(tangentAt(prim, 3)[3], convertCoordinates ? 1 : -1);
+    }
+});
+
+test("collapsed decoded tangents use generated tangents when the UV basis fits the selected normal", () =>
+{
+    const shared = squareShared({
+        normals: [ 2, 0, 0, 2, 0, 0, 2, 0, 0, 2, 0, 0 ],
+        uvs: [ 0, 0, 0, 1, 1, 1, 1, 0 ]
+    });
+    const { primitives, diagnostics } = extractGeometry(shared, { convertCoordinates: false });
+    assert.equal(diagnostics.tangents.invalidFrames, 4);
+    assert.equal(diagnostics.tangents.repaired, 4);
+    assert.equal(diagnostics.tangents.degenerateFallbacks, 0);
+    for (let i = 0; i < 4; i++)
+    {
+        assert.deepEqual(tangentAt(primitives[0], i).slice(0, 3), [ 0, 1, 0 ]);
+    }
 });
 
 test("a missing packed channel generates tangents for every vertex", () =>
@@ -469,6 +541,28 @@ test("index groups coerce to 16-bit arrays and widen only when required", () =>
     wide.meshes[0].vertex.normal[5] = 1;
     wide.meshes[0].vertex.normal[8] = 1;
     assert.ok(extractGeometry(wide).primitives[0].indices instanceof Uint32Array);
+});
+
+test("index groups widen at glTF's reserved 16-bit index value", () =>
+{
+    const vertexCount = 65536;
+    const shared = { meshes: [ makeMesh({
+        positions: new Float32Array(vertexCount * 3),
+        uvs: new Float32Array(vertexCount * 2),
+        groups: [
+            new Uint16Array([ 0, 1, 65534 ]),
+            new Uint16Array([ 0, 1, 65535 ]),
+            new Uint32Array([ 0, 1, 2 ])
+        ],
+        bytesPerIndex: 2
+    }) ] };
+    const { primitives } = extractGeometry(shared, { convertCoordinates: false });
+    assert.ok(primitives[0].indices instanceof Uint16Array);
+    assert.deepEqual([...primitives[0].indices], [ 0, 1, 65534 ]);
+    assert.ok(primitives[1].indices instanceof Uint32Array);
+    assert.deepEqual([...primitives[1].indices], [ 0, 1, 65535 ]);
+    assert.ok(primitives[2].indices instanceof Uint32Array);
+    assert.deepEqual([...primitives[2].indices], [ 0, 1, 2 ]);
 });
 
 test("zero-triangle groups are preserved, not dropped", () =>
