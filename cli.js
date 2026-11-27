@@ -22,7 +22,7 @@
  * the convert phase runs fully offline.
  */
 
-import { readFile, readdir, realpath, stat, writeFile } from "node:fs/promises";
+import { lstat, readFile, readdir, readlink, realpath, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { convertShip } from "./src/convert.js";
 import { runBatch, runBatchResolve } from "./src/batch.js";
@@ -262,7 +262,20 @@ async function canonicalPath(path)
     {
         if (error.code !== "ENOENT") throw error;
         const absolute = resolve(path);
-        return join(await realpath(dirname(absolute)), basename(absolute));
+        const info = await lstat(absolute).catch((error) =>
+        {
+            if (error.code !== "ENOENT") throw error;
+            return null;
+        });
+        if (info?.isSymbolicLink())
+        {
+            // realpath cannot follow a link whose target does not exist yet.
+            // Resolve that target so a report cannot alias a future artifact.
+            return canonicalPath(resolve(dirname(absolute), await readlink(absolute)));
+        }
+        const parent = dirname(absolute);
+        if (parent === absolute) throw error;
+        return join(await canonicalPath(parent), basename(absolute));
     }
 }
 

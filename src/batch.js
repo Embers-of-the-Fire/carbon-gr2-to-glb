@@ -37,9 +37,9 @@
  * }
  */
 
-import { chmod, lstat, mkdir, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, readlink, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { convertShip } from "./convert.js";
 import { createSofContext, resolveSofDna, sofShipHash } from "./sof.js";
 import { makeMappedTextureResolver } from "./bake.js";
@@ -150,13 +150,26 @@ export async function runBatch(manifest, hooks = {})
                 continue;
             }
             let outputPath = job.out;
+            let outputInfo;
             try
             {
-                if ((await lstat(job.out)).isSymbolicLink()) outputPath = await realpath(job.out);
+                outputInfo = await lstat(job.out);
             }
             catch (error)
             {
                 if (error.code !== "ENOENT") throw error;
+            }
+            if (outputInfo?.isSymbolicLink())
+            {
+                try
+                {
+                    outputPath = await realpath(job.out);
+                }
+                catch (error)
+                {
+                    if (error.code !== "ENOENT") throw error;
+                    outputPath = resolve(dirname(job.out), await readlink(job.out));
+                }
             }
             await mkdir(dirname(outputPath), { recursive: true });
             const temporary = join(dirname(outputPath), `.tmp-${randomUUID()}`);
@@ -171,7 +184,7 @@ export async function runBatch(manifest, hooks = {})
                 {
                     if (error.code !== "ENOENT") throw error;
                 }
-                await writeFile(temporary, glb);
+                await writeFile(temporary, glb, { mode: existingMode ?? 0o666 });
                 if (existingMode !== undefined) await chmod(temporary, existingMode);
                 await rename(temporary, outputPath);
             }

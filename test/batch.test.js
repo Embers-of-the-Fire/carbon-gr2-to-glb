@@ -1,12 +1,17 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { CjsGr2Format } from "@carbonenginejs/runtime/resource/formats/gr2";
 import { runBatch } from "../src/batch.js";
 import { sofShipHash } from "../src/sof.js";
 import { validateGlb } from "../src/validate.js";
+
+const execFileAsync = promisify(execFile);
 
 function sofShip()
 {
@@ -216,6 +221,137 @@ test("runBatch converts a base job from a pre-resolved sof end to end", async (t
     assert.deepEqual(await readdir(outDir), [ "587.glb" ]);
     const report = await validateGlb(new Uint8Array(await readFile(out)), { variant: "base", expectedTriangles: 1 });
     assert.equal(report.valid, true, report.errors.join("\n"));
+});
+
+test("runBatch preserves output symlinks when publishing", async (t) =>
+{
+    for (const targetExists of [ true, false ])
+    {
+        await t.test(targetExists ? "existing target" : "missing target", async (t) =>
+        {
+            const directory = await mkdtemp(join(tmpdir(), "carbon-gr2-batch-symlink-"));
+            t.after(() => rm(directory, { recursive: true, force: true }));
+            const gr2 = join(directory, "mf4_t1.gr2");
+            const outDir = join(directory, "out");
+            const targetDir = join(directory, "published");
+            const out = join(outDir, "587.glb");
+            const target = join(targetDir, "587.glb");
+            const linkTarget = join("..", "published", "587.glb");
+            await writeFile(gr2, syntheticGr2());
+            await mkdir(outDir, { recursive: true });
+            if (targetExists)
+            {
+                await mkdir(targetDir, { recursive: true });
+                await writeFile(target, "stale glb sentinel");
+            }
+            await symlink(linkTarget, out);
+
+            const { results } = await runBatch({
+                dataBlack: "/nonexistent/data.black",
+                texture: { format: "none" },
+                jobs: [
+                    {
+                        id: "587",
+                        dna: "mf4_t1:minmatarbase:minmatar",
+                        sof: sofShip(),
+                        gr2,
+                        textures: {},
+                        out
+                    }
+                ]
+            });
+
+            assert.equal(results.length, 1);
+            assert.equal(results[0].error, undefined);
+            assert.equal(results[0].out, out);
+            assert.equal((await lstat(out)).isSymbolicLink(), true);
+            assert.equal(await readlink(out), linkTarget);
+            const output = await readFile(target);
+            assert.deepEqual(await readFile(out), output);
+            const report = await validateGlb(new Uint8Array(output), { variant: "base", expectedTriangles: 1 });
+            assert.equal(report.valid, true, report.errors.join("\n"));
+            assert.deepEqual(await readdir(targetDir), [ "587.glb" ]);
+        });
+    }
+});
+
+test("batch CLI rejects a dangling statistics symlink to an artifact before writing", async (t) =>
+{
+    const directory = await mkdtemp(join(tmpdir(), "carbon-gr2-batch-cli-"));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const gr2 = join(directory, "mf4_t1.gr2");
+    const out = join(directory, "new", "models", "ship.glb");
+    const statsOut = join(directory, "stats.json");
+    const linkTarget = join("new", "models", "ship.glb");
+    const manifestPath = join(directory, "manifest.json");
+    await writeFile(gr2, syntheticGr2());
+    await writeFile(manifestPath, JSON.stringify({
+        dataBlack: "/nonexistent/data.black",
+        texture: { format: "none" },
+        jobs: [
+            {
+                id: "587",
+                dna: "mf4_t1:minmatarbase:minmatar",
+                sof: sofShip(),
+                gr2,
+                textures: {},
+                out
+            }
+        ]
+    }));
+    await symlink(linkTarget, statsOut);
+
+    await assert.rejects(execFileAsync(process.execPath, [
+        fileURLToPath(new URL("../cli.js", import.meta.url)),
+        "--batch", manifestPath,
+        "--stats-out", statsOut
+    ]), (error) =>
+    {
+        assert.equal(error.code, 1);
+        assert.match(error.stderr, /statistics path .* conflicts with artifact/);
+        return true;
+    });
+
+    await assert.rejects(lstat(out), { code: "ENOENT" });
+    assert.equal((await lstat(statsOut)).isSymbolicLink(), true);
+    assert.equal(await readlink(statsOut), linkTarget);
+});
+
+test("batch CLI accepts an artifact in output directories that do not exist yet", async (t) =>
+{
+    const directory = await mkdtemp(join(tmpdir(), "carbon-gr2-batch-cli-"));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const gr2 = join(directory, "mf4_t1.gr2");
+    const out = join(directory, "new", "models", "ship.glb");
+    const statsOut = join(directory, "stats.json");
+    const manifestPath = join(directory, "manifest.json");
+    await writeFile(gr2, syntheticGr2());
+    await writeFile(manifestPath, JSON.stringify({
+        dataBlack: "/nonexistent/data.black",
+        texture: { format: "none" },
+        jobs: [
+            {
+                id: "587",
+                dna: "mf4_t1:minmatarbase:minmatar",
+                sof: sofShip(),
+                gr2,
+                textures: {},
+                out
+            }
+        ]
+    }));
+
+    const { stderr } = await execFileAsync(process.execPath, [
+        fileURLToPath(new URL("../cli.js", import.meta.url)),
+        "--batch", manifestPath,
+        "--stats-out", statsOut
+    ]);
+
+    assert.match(stderr, /converted 1\/1 jobs/);
+    assert.ok((await readFile(out)).length > 0);
+    const diagnostics = JSON.parse(await readFile(statsOut, "utf8"));
+    assert.equal(diagnostics.results[0].out, out);
+    assert.equal(diagnostics.results[0].error, undefined);
 });
 
 test("runBatch produces byte-identical GLBs for two identical conversions", async (t) =>
