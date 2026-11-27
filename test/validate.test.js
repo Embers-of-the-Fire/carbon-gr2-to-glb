@@ -66,6 +66,21 @@ test("independent validation rejects invalid indices", async () =>
     assert.ok(report.errors.some((error) => /index 3 is outside 3 vertices/.test(error)));
 });
 
+test("independent validation rejects LINES primitives instead of counting them as triangles", async () =>
+{
+    const bytes = await fixture();
+    const jsonLength = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(12, true);
+    const json = new TextDecoder().decode(bytes.subarray(20, 20 + jsonLength));
+    const lineModeJson = json.replace('"mode":4', '"mode":1');
+    assert.notEqual(lineModeJson, json);
+    bytes.set(new TextEncoder().encode(lineModeJson), 20);
+
+    const report = await validateGlb(bytes, { expectedTriangles: 1 });
+    assert.equal(report.valid, false);
+    assert.equal(report.stats.triangles, 0);
+    assert.ok(report.errors.some((error) => /primitive mode 1 is not TRIANGLES/.test(error)));
+});
+
 test("independent validation rejects missing or invalid primitive materials", async () =>
 {
     for (const material of [ null, 1 ])

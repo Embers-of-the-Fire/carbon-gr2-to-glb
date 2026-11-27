@@ -122,6 +122,11 @@ export async function validateGlb(bytes, options = {})
     {
         for (const primitive of mesh.listPrimitives())
         {
+            if (primitive.getMode() !== 4)
+            {
+                errors.push(`${mesh.getName()}: primitive mode ${primitive.getMode()} is not TRIANGLES`);
+                continue;
+            }
             const position = primitive.getAttribute("POSITION");
             const normal = primitive.getAttribute("NORMAL");
             const tangent = primitive.getAttribute("TANGENT");

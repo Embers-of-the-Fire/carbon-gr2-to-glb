@@ -22,7 +22,7 @@
  * the convert phase runs fully offline.
  */
 
-import { readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { readFile, readdir, realpath, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { convertShip } from "./src/convert.js";
 import { runBatch, runBatchResolve } from "./src/batch.js";
@@ -175,7 +175,7 @@ async function runBatchResolveCli(path, resolveOut)
 async function runBatchCli(path, statsOut)
 {
     const manifest = JSON.parse(await readFile(path, "utf8"));
-    assertReportPathDoesNotCollide(statsOut, (manifest.jobs ?? []).map((job) => job.out).filter(Boolean));
+    await assertReportPathDoesNotCollide(statsOut, (manifest.jobs ?? []).map((job) => job.out).filter(Boolean));
     const { results } = await runBatch(manifest, {
         onProgress: (job, stats) =>
         {
@@ -252,19 +252,50 @@ async function collectGlbFiles(path)
     return files.sort();
 }
 
-function assertReportPathDoesNotCollide(reportPath, artifactPaths)
+async function canonicalPath(path)
+{
+    try
+    {
+        return await realpath(path);
+    }
+    catch (error)
+    {
+        if (error.code !== "ENOENT") throw error;
+        const absolute = resolve(path);
+        return join(await realpath(dirname(absolute)), basename(absolute));
+    }
+}
+
+async function assertReportPathDoesNotCollide(reportPath, artifactPaths)
 {
     if (!reportPath) return;
-    const report = resolve(reportPath);
-    const collision = artifactPaths.find((artifact) => resolve(artifact) === report);
-    if (collision) throw new Error(`statistics path ${reportPath} conflicts with artifact ${collision}`);
+    const report = await canonicalPath(reportPath);
+    const reportInfo = await stat(reportPath).catch((error) =>
+    {
+        if (error.code !== "ENOENT") throw error;
+        return null;
+    });
+    for (const artifact of artifactPaths)
+    {
+        const artifactCanonical = await canonicalPath(artifact);
+        const artifactInfo = await stat(artifact).catch((error) =>
+        {
+            if (error.code !== "ENOENT") throw error;
+            return null;
+        });
+        if (artifactCanonical === report ||
+            (reportInfo && artifactInfo && reportInfo.dev === artifactInfo.dev && reportInfo.ino === artifactInfo.ino))
+        {
+            throw new Error(`statistics path ${reportPath} conflicts with artifact ${artifact}`);
+        }
+    }
 }
 
 async function runValidateCli(path, statsOut, variant)
 {
     const files = await collectGlbFiles(path);
     if (!files.length) throw new Error(`no .glb files found under ${path}`);
-    assertReportPathDoesNotCollide(statsOut, files);
+    await assertReportPathDoesNotCollide(statsOut, files);
     const results = [];
     for (const file of files)
     {
